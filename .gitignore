@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# NOT FOR PUBLICATION
+# ---------------------------------------------------------------------------
+# Reverse-engineering working notes. Kept locally; deliberately not published.
+ENHANCED_PORT.md
+
+# Pre-refactor copy of the removed ReShade overlay. This project has no history
+# to recover it from, which is why it exists at all - it is a local backup, not
+# part of the mod.
+_removed_overlay_backup/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+build.vs/
+build/
+out/
+x64/
+*.asi
+*.zip
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.map
+*.obj
+
+# ---------------------------------------------------------------------------
+# Runtime artefacts - written next to the game, but easy to drag in by mistake
+#
+# The two .ini files at the REPO ROOT are sources, not artefacts: CMake copies
+# both next to the built .asi, so ignoring them would break a fresh clone's
+# build. Only the copies that appear elsewhere are excluded.
+# ---------------------------------------------------------------------------
+*.log
+Captures/
+markers/
+ffmpeg.exe
+*/Render.ini
+*/RockstarEditorPlus.ini
+!/Render.ini
+!/RockstarEditorPlus.ini
+
+# presets\ is a runtime folder next to the game, EXCEPT the shipped set under
+# dist\ - the README names those five by name, so a clone needs them.
+presets/
+!dist/RockstarEditorPlus/presets/
+!dist/RockstarEditorPlus/presets/*.ini
+
+# ---------------------------------------------------------------------------
+# Editor / OS
+# ---------------------------------------------------------------------------
+.vs/
+.vscode/
+CMakeSettings.json
+*.user
+Thumbs.db
+desktop.ini

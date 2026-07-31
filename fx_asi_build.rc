@@ -1,0 +1,49 @@
+// FiveM ASI build declaration.
+//
+// FiveM's asi-five loader maps each .asi with LOAD_LIBRARY_AS_DATAFILE and looks
+// for an FX_ASI_BUILD resource whose TYPE id is the running game build. Without
+// a matching entry it refuses to load the plugin at all and says so on screen.
+//
+// Every build FiveM offers is listed, DELIBERATELY, even though the game
+// signatures in src/game/signatures.h are only derived for current builds. The
+// choice is between two failure modes on an old build:
+//
+//   not declared - FiveM refuses the plugin and shows an error, which reads to
+//                  a user as "the mod is broken / won't launch"
+//   declared     - the plugin loads, game::resolve() finds nothing, and it stays
+//                  dormant. Nothing happens, quietly.
+//
+// The second is the better failure. game::resolve() succeeds or fails as a unit
+// and nothing installs unless every signature resolved, so a build we cannot
+// pattern costs a log line, not a crash - which is what makes declaring builds
+// we have not verified safe to do here.
+//
+// Verified: 3889 (GTA5.exe 1.0.3889.0), all 23 Legacy signatures resolving.
+// Everything else is declared for graceful degradation, not tested.
+//
+// Listing a build FiveM does not offer is harmless - it is simply never matched
+// - so this is the union of FiveM's own build list and the set other ASIs ship.
+// This resource is only ever read by FiveM; it is inert in a normal game.
+FX_ASI_BUILD 1604 BEGIN "\0" END
+FX_ASI_BUILD 2060 BEGIN "\0" END
+FX_ASI_BUILD 2189 BEGIN "\0" END
+FX_ASI_BUILD 2372 BEGIN "\0" END
+FX_ASI_BUILD 2545 BEGIN "\0" END
+FX_ASI_BUILD 2612 BEGIN "\0" END
+FX_ASI_BUILD 2628 BEGIN "\0" END
+FX_ASI_BUILD 2699 BEGIN "\0" END
+FX_ASI_BUILD 2802 BEGIN "\0" END
+FX_ASI_BUILD 2944 BEGIN "\0" END
+FX_ASI_BUILD 3095 BEGIN "\0" END
+FX_ASI_BUILD 3258 BEGIN "\0" END
+FX_ASI_BUILD 3323 BEGIN "\0" END
+FX_ASI_BUILD 3407 BEGIN "\0" END
+FX_ASI_BUILD 3442 BEGIN "\0" END
+FX_ASI_BUILD 3504 BEGIN "\0" END
+FX_ASI_BUILD 3521 BEGIN "\0" END
+FX_ASI_BUILD 3570 BEGIN "\0" END
+FX_ASI_BUILD 3586 BEGIN "\0" END
+FX_ASI_BUILD 3717 BEGIN "\0" END
+FX_ASI_BUILD 3751 BEGIN "\0" END
+FX_ASI_BUILD 3788 BEGIN "\0" END
+FX_ASI_BUILD 3889 BEGIN "\0" END
