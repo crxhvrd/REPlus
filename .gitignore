@@ -12,6 +12,11 @@ _removed_overlay_backup/
 # ---------------------------------------------------------------------------
 # Build output
 # ---------------------------------------------------------------------------
+# The assembled release bundle. Everything in it is either a build output or a
+# third-party binary (ffmpeg is ~100MB on its own), so it is packaged and
+# attached to a GitHub release rather than tracked here.
+dist/
+
 build.vs/
 build/
 out/

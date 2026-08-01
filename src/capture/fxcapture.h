@@ -7,6 +7,7 @@
 
 #pragma once
 #include <cstdint>
+#include <string>
 
 // =============================================================================
 //  Frame capture channel
@@ -79,4 +80,10 @@ namespace fxcapture
 	// RockstarEditorPlus_Captures folder beside GTA5.exe is used. Either way the
 	// render itself gets a numbered subfolder inside it.
 	bool newSequenceFolder(const char* base, char* outFolder, int cap);
+
+	// Where renders WILL go, without creating anything. Same resolution
+	// newSequenceFolder uses, minus the numbered subfolder - so it can be logged
+	// at startup, before any render exists. Under FiveM this is beside the .asi
+	// in plugins\, which is not where people look first.
+	std::string captureBaseDir(const char* base);
 }

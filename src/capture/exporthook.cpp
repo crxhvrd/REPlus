@@ -42,6 +42,26 @@ namespace exporthook
 
 		void __fastcall hkOpen(int type, unsigned arg)
 		{
+			// Report each playback type the first time it comes through.
+			//
+			// Without this, "Export produced a normal bake" and "Export never
+			// reached us" look identical in the log - both are simply an absence
+			// of lines, and the two have completely different causes. One report
+			// cost a round trip for exactly that reason.
+			//
+			// Deduplicated by type, so this is a handful of lines a session, not
+			// a per-open stream. type 0 = PREVIEW_FULL_PROJECT, 1 = BAKE.
+			{
+				static unsigned s_seen = 0;
+				if (type >= 0 && type < 32 && !(s_seen & (1u << type)))
+				{
+					s_seen |= (1u << type);
+					logger::write("info", "export: playback Open(type=%d, arg=%u)%s",
+						type, arg,
+						type == gsig::PLAYBACK_TYPE_BAKE ? "  <- this is Export/bake" : "");
+				}
+			}
+
 			if (type == gsig::PLAYBACK_TYPE_BAKE &&
 			    Config::get().enableRenderer)
 			{
@@ -64,8 +84,22 @@ namespace exporthook
 					// Falling through to a real bake would be worse than doing
 					// nothing: the user asked for an image sequence and would
 					// silently get a watermarked, codec-compressed video.
+					//
+					// Say WHY, not just that. "Addon not loaded" sends people
+					// hunting for a missing file, but the usual cause is an addon
+					// that IS loaded and simply never presents - its heartbeat
+					// only ticks from ReShade's present callback, so anything that
+					// takes over presenting (an ENB d3d11.dll in front of
+					// ReShade's dxgi.dll, add-on support switched off) leaves the
+					// file sitting there doing nothing. The channel state
+					// distinguishes those without a second round trip.
 					logger::write("info",
-						"export: capture addon not loaded - leaving the game's own export alone");
+						"export: capture addon not usable - leaving the game's own export "
+						"alone. channel=%s heartbeat=%u. If IgcsConnector.addon64 is present, "
+						"it is loaded but never presenting: check ReShade has add-on support, "
+						"that IgcsDOF is enabled, and that nothing else (ENB) owns present.",
+						fxcapture::available() ? "mapped" : "NOT MAPPED",
+						fxcapture::heartbeat());
 				}
 			}
 

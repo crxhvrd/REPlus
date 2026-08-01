@@ -31,6 +31,10 @@ namespace rsettings
 		std::string                   g_path;
 		bool                          g_dirty = false;
 
+		// Tick count of the most recent change, for the debounce in tick().
+		// 0 = nothing pending.
+		unsigned long                 g_dirtyAt = 0;
+
 		// The camera hook reads these on the sim thread while the ReShade
 		// overlay writes them on the render thread. A std::map is not safe
 		// under that, so every entry point takes this lock. Contention is nil:
@@ -57,12 +61,13 @@ namespace rsettings
 		const Key k = keyOf(timeMs);
 		if (s.isDefault())
 		{
-			if (g_entries.erase(k)) g_dirty = true;
+			if (g_entries.erase(k)) { g_dirty = true; g_dirtyAt = GetTickCount(); }
 		}
 		else
 		{
 			g_entries[k] = s;
 			g_dirty = true;
+			g_dirtyAt = GetTickCount();
 		}
 	}
 
@@ -79,6 +84,7 @@ namespace rsettings
 		g_entries.erase(it);
 		g_entries[to] = s;
 		g_dirty = true;
+		g_dirtyAt = GetTickCount();
 	}
 
 	int count()
@@ -209,6 +215,32 @@ namespace rsettings
 			(int)g_entries.size(), g_path.c_str());
 	}
 
+	// Deferred flush. Call every frame; it writes at most once per quiet period.
+	//
+	// save() rewrites the WHOLE side-car - open with trunc, walk every entry,
+	// close - and the menu used to call it on each left/right step. Held input
+	// repeats around 30 times a second, so adjusting one value meant thirty full
+	// file rewrites a second, which is what made changing a marker feel heavy in
+	// a project with a few markers in it.
+	//
+	// Nothing needs the file to be current mid-keypress; it only has to be right
+	// by the time the game closes or the project changes. So the menu now just
+	// dirties the store and this coalesces the burst into one write once the
+	// user stops moving. The explicit save() calls that remain are the ones with
+	// a real deadline - project switch, shutdown.
+	void tick()
+	{
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			if (!g_dirty || g_dirtyAt == 0) return;
+
+			// ~0.5s of quiet. Long enough to swallow a held adjustment, short
+			// enough that a crash costs one edit rather than a session.
+			if (GetTickCount() - g_dirtyAt < 500) return;
+		}
+		save();
+	}
+
 	void save()
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
@@ -238,5 +270,6 @@ namespace rsettings
 		}
 
 		g_dirty = false;
+		g_dirtyAt = 0;
 	}
 }

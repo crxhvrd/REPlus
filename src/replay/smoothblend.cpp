@@ -1388,6 +1388,10 @@ namespace smoothblend
 		// or abort cleanly if the mod is toggled off mid-way.
 		render::pump();
 
+		// Deferred flush of per-marker settings. Cheap: a compare until the
+		// store has actually been quiet for half a second. See rsettings::tick.
+		rsettings::tick();
+
 		// Same argument, and the same thread requirement: a depth-of-field
 		// session's requests arrive on ReShade's thread but its seeks have to
 		// happen here. Outside the enabled check so a session in flight can

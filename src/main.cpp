@@ -173,7 +173,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 
 		Config::get().load(hModule);
 		logger::init();
-		logger::write("info", "RockstarEditorPlus: attached");
+		// Stamp the build on the first line.
+		//
+		// Triaging user reports without this is guesswork: most of what a fix
+		// changes only shows in the log when the thing it fixes is exercised, so
+		// two builds a dozen commits apart produce identical startup logs. Every
+		// "is this the latest .asi?" round trip in a bug report is this line
+		// missing.
+		logger::write("info", "RockstarEditorPlus: attached (build " __DATE__ " " __TIME__ ")");
 
 		// Decide whether this process is ours BEFORE touching it.
 		//

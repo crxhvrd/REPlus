@@ -10,16 +10,21 @@
 //
 //   not declared - FiveM refuses the plugin and shows an error, which reads to
 //                  a user as "the mod is broken / won't launch"
-//   declared     - the plugin loads, game::resolve() finds nothing, and it stays
-//                  dormant. Nothing happens, quietly.
+//   declared     - the plugin loads and runs. Whatever resolves, works.
 //
-// The second is the better failure. game::resolve() succeeds or fails as a unit
-// and nothing installs unless every signature resolved, so a build we cannot
-// pattern costs a log line, not a crash - which is what makes declaring builds
-// we have not verified safe to do here.
+// The second is the better failure, and it degrades PER SIGNATURE rather than
+// all-or-nothing: every address is scanned independently, a miss leaves null,
+// and each consumer is guarded - `if (addr) hook() else log("unresolved")`. So
+// an old build loses exactly the features whose patterns moved and keeps the
+// rest. Observed on b3258: UpdateCollision and the profanity poll site missed,
+// while the spline, shake, menu, distance leash and export all worked.
+//
+// resolve() itself only returns false when a build has NO signature set at all
+// (Enhanced's are deliberately empty). A failed scan is not fatal.
 //
 // Verified: 3889 (GTA5.exe 1.0.3889.0), all 23 Legacy signatures resolving.
-// Everything else is declared for graceful degradation, not tested.
+// 3751 resolves all but UpdateCollision. Everything else is declared for
+// graceful degradation, not tested.
 //
 // Listing a build FiveM does not offer is harmless - it is simply never matched
 // - so this is the union of FiveM's own build list and the set other ASIs ship.

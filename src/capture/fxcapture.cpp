@@ -177,4 +177,18 @@ namespace fxcapture
 		}
 		return false;
 	}
+
+	// Same resolution as above, without creating anything - see the header.
+	std::string captureBaseDir(const char* base)
+	{
+		if (base && *base)
+		{
+			std::string b = base;
+			while (!b.empty() && (b.back() == '\\' || b.back() == '/')) b.pop_back();
+			return b;
+		}
+		std::string caps = paths::sub("Captures");
+		if (!caps.empty() && caps.back() == '\\') caps.pop_back();
+		return caps;
+	}
 }

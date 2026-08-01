@@ -53,6 +53,22 @@ public:
 		return _base;
 	}
 
+	// SizeOfImage for the game module, read from its own headers. Used to sanity
+	// check anything resolved by interior offset: a RIP-relative operand always
+	// points inside the module, so a result outside it means the displacement
+	// was read from the wrong place.
+	inline static uintptr_t imageSize()
+	{
+		static uintptr_t _size = [] () -> uintptr_t {
+			const uintptr_t b = base();
+			if (!b) return 0;
+			const auto* dos = (PIMAGE_DOS_HEADER)b;
+			const auto* nt  = (PIMAGE_NT_HEADERS)((std::uint8_t*)b + dos->e_lfanew);
+			return nt->OptionalHeader.SizeOfImage;
+		}();
+		return _size;
+	}
+
 	inline static memory& virtual_mem()
 	{
 		static memory _virtualmem(0, false);

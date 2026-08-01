@@ -178,17 +178,30 @@ namespace game
 		return jumpTo(t, jumpOptions ? jumpOptions : gsig::JUMPOPTS_EDITOR_SEEK);
 	}
 
-	bool replayBusy()
+	// Which of the three sub-conditions is holding replayBusy() true, or nullptr
+	// if none is.
+	//
+	// Worth having separately because "busy" is three unrelated things and they
+	// mean different things to a user: a loading screen is transient, a stuck
+	// precache in a heavily modded install is not. A report of "never settled to
+	// EDIT (saw 2)" - i.e. the mode was already EDIT and it was this that
+	// blocked - could not be taken any further without it.
+	const char* replayBusyReason()
 	{
-		// The black-logo frames come from this call, not from a flag.
 		if (addr_ShouldShowLoading)
 		{
 			using Fn = bool(__fastcall*)();
-			if (((Fn)addr_ShouldShowLoading)()) return true;
+			if (((Fn)addr_ShouldShowLoading)()) return "ShouldShowLoading";
 		}
-		if (addr_g_LoadingScreen && *(unsigned char*)addr_g_LoadingScreen) return true;
-		if (addr_g_PreCaching    && *(unsigned char*)addr_g_PreCaching)    return true;
-		return false;
+		if (addr_g_LoadingScreen && *(unsigned char*)addr_g_LoadingScreen) return "g_LoadingScreen";
+		if (addr_g_PreCaching    && *(unsigned char*)addr_g_PreCaching)    return "g_PreCaching (streaming precache)";
+		return nullptr;
+	}
+
+	bool replayBusy()
+	{
+		// The black-logo frames come from this call, not from a flag.
+		return replayBusyReason() != nullptr;
 	}
 
 	bool requestPlaybackClose()
@@ -257,6 +270,29 @@ namespace game
 		// rip() resolves disp+4; `extra` accounts for any trailing immediate
 		// that makes the instruction longer than that.
 		const uintptr_t a = memory(base).add(d.disp).rip().address + d.extra;
+
+		// The result must land INSIDE the game module. A RIP-relative operand
+		// always does, so anything outside means we read the displacement from
+		// the wrong place - and the opcode check above cannot catch that, since
+		// it validates the instruction at `insn` while the displacement is taken
+		// from `disp`. Get those two out of step and you get a plausible-looking
+		// pointer that only fails when something finally dereferences it.
+		//
+		// That is not hypothetical: JTND_CONTROLLER carried disp=3 instead of
+		// 0x43, resolved ~190MB past the end of the image, logged happily as
+		// rva 0xF5A0E22, and crashed the game on the first Export with the
+		// renderer enabled. A range check turns that into a clean bail at
+		// resolve time and one obvious log line.
+		if (a < memory::base() || a >= memory::base() + memory::imageSize())
+		{
+			logger::write("info",
+				"  !! %s: derived %p is outside the module (rva 0x%llX) - refusing it. "
+				"The Derive's disp is probably wrong; it is an offset from the "
+				"FUNCTION START, i.e. insn + opLen.",
+				what, (void*)a, (uint64_t)(a - memory::base()));
+			return 0;
+		}
+
 		logger::write("info", "  %-22s = %p (rva 0x%llX)", what, (void*)a,
 			(uint64_t)(a - memory::base()));
 		return a;

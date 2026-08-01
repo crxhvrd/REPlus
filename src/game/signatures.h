@@ -156,7 +156,27 @@ namespace gsig
 	// clip of a multi-clip project, and it returns to EDIT on its own afterwards.
 	// DISABLED is the only value that actually means the editor is gone.
 	inline constexpr int  REPLAYMODE_DISABLED = 0;
+	inline constexpr int  REPLAYMODE_RECORD   = 1;
 	inline constexpr int  REPLAYMODE_LOADCLIP = 3;
+
+	// Despite the name, this is the ordinary way INTO playback, not an error
+	// state: CReplayMgrInternal::TriggerPlayback sets it as the desired mode and
+	// the clip is committed through the savegame queue before the manager settles
+	// to EDIT. A diverted export sits here for as long as that takes.
+	//
+	// It is named because a bare "saw 4" in a user's log is not diagnosable, and
+	// mode 4 is the one a stalled export actually reports.
+	inline constexpr int  REPLAYMODE_WAITINGFORSAVE = 4;
+
+	inline constexpr const char* replayModeName(int m)
+	{
+		return m == REPLAYMODE_DISABLED        ? "DISABLED"
+		     : m == REPLAYMODE_RECORD          ? "RECORD"
+		     : m == REPLAYMODE_EDIT            ? "EDIT"
+		     : m == REPLAYMODE_LOADCLIP        ? "LOADCLIP"
+		     : m == REPLAYMODE_WAITINGFORSAVE  ? "WAITINGFORSAVE"
+		     : "?";
+	}
 
 	inline constexpr Sig REPLAYDIRECTOR_GETMAXDISTANCE = {
 		// enh 0x235EE0. Body is identical to Legacy line for line -
@@ -808,7 +828,15 @@ namespace gsig
 	// Enhanced inlines that whole function and takes IS_CONTROLLER instead.
 	// Without this, clipRange() fails on Legacy and multi-clip renders stop at
 	// the first clip boundary.
-	inline constexpr Derive JTND_CONTROLLER = { 0x40, 3, OP_LEA_RCX, 3, 0 };
+	// disp is an offset from the FUNCTION START, not from the instruction - so it
+	// is insn + opLen, 0x40 + 3. It read 3 for a long time, which passed the
+	// opcode guard (that checks +0x40, which is correct) and then took the
+	// displacement from the function's prologue instead: a pointer ~190MB past
+	// the end of the image, reported as a healthy-looking rva 0xF5A0E22 in the
+	// log. Nothing touches it until a render starts, so the ASI came up clean and
+	// then took the game down the moment Export was pressed with the renderer on.
+	// The same trap the GNMI_GETPREV comment above warns about.
+	inline constexpr Derive JTND_CONTROLLER = { 0x40, 0x43, OP_LEA_RCX, 3, 0 };
 
 	// The editor passes 5, not 0, when it seeks.
 	inline constexpr unsigned JUMPOPTS_EDITOR_SEEK = 5;

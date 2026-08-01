@@ -79,6 +79,8 @@ namespace render
 		int   s_clipWait   = 0;     // frames spent waiting for one clip step
 
 		int   s_pendWait  = 0;      // frames spent waiting for a diverted export
+		unsigned long s_pendStart = 0; // tick when that wait began; 0 = not waiting
+		unsigned long s_pendLog   = 0; // tick of the last "still waiting" line
 		int   s_startMode = -1;     // replay mode the render began in
 		int   s_busyWait  = 0;      // frames spent waiting out a clip load
 		int   s_modeWait  = 0;      // frames spent in a transient replay mode
@@ -787,6 +789,29 @@ namespace render
 		s_cfg.quality      = c.renderQuality;
 		s_cfg.highlight    = c.renderHighlight;
 		s_cfg.channelOrder = c.renderChannelOrder;
+
+		// State the destination at startup, not only when a render begins.
+		//
+		// It was previously only in the "render: started ... -> <folder>" line,
+		// which is no use to anyone whose render never started - and that is
+		// exactly the person asking where the output went. It also moved with the
+		// path fix: under FiveM it now resolves beside the .asi in plugins\,
+		// rather than the subprocess cache older builds used, so even a working
+		// setup can have output in an unexpected place after an update.
+		{
+			static std::string s_lastReported;
+			const std::string dir =
+				fxcapture::captureBaseDir(Config::get().renderOutputFolder.c_str());
+			if (dir != s_lastReported)
+			{
+				s_lastReported = dir;
+				logger::write("info", "render: output -> %s\\render_NNNN%s",
+					dir.c_str(),
+					Config::get().renderOutputFolder.empty()
+						? "   (RenderOutputFolder is empty, so this is the default)"
+						: "   (from RenderOutputFolder)");
+			}
+		}
 	}
 
 	bool active()      { return s_step != Step::Idle; }
@@ -1024,20 +1049,77 @@ namespace render
 		if (s_step == Step::Idle && exporthook::pending())
 		{
 			// The seek we rely on refuses to move unless the replay mode is EDIT,
-			// and Open() leaves it mid-transition for a few frames. Starting
-			// during that window is what made the first attempt abort instantly.
+			// and Open() leaves it mid-transition for a while. Starting during
+			// that window is what made the first attempt abort instantly.
+			//
+			// Bounded by WALL CLOCK, not by a frame count. It used to give up
+			// after 900 pump() calls, described in a comment as "~15s at 60fps" -
+			// which is only true at 60fps. A user reported this failing after
+			// 4.8 seconds, because their machine was running the editor fast
+			// enough to burn 900 frames in that time. The thing being waited on is
+			// a savegame-queue commit (REPLAYMODE_WAITINGFORSAVE, which is what
+			// TriggerPlayback sets on the way into playback) and that takes as
+			// long as the disk takes, entirely unrelated to frame rate.
+			// WAIT, do not race a timer.
+			//
+			// A short bound here is simply wrong. Loading and precaching take as
+			// long as the install takes - minutes on a heavily modded setup - and
+			// giving up does not fall back to anything: the bake was already
+			// diverted, so an abort costs the user the export entirely and they
+			// have to press Export again. The people most likely to be cut off
+			// are exactly the ones with the most content to stream.
+			//
+			// So wait for as long as the editor is still somewhere a render makes
+			// sense, and report progress instead of sitting silent. The backstop
+			// exists only to stop a genuine hang pending forever; it is not a
+			// judgement about how long loading is allowed to take.
 			if (game::replayMode() != gsig::REPLAYMODE_EDIT || game::replayBusy())
 			{
-				if (++s_pendWait > 900)
+				const unsigned long now = GetTickCount();
+				if (s_pendStart == 0) { s_pendStart = now; s_pendLog = now; }
+
+				const int   mode = game::replayMode();
+				const char* busy = game::replayBusyReason();
+
+				// The editor closed under us - nothing left to render into.
+				if (mode == gsig::REPLAYMODE_DISABLED)
 				{
 					exporthook::clearPending();
-					s_pendWait = 0;
+					s_pendWait = 0; s_pendStart = 0;
 					logger::write("info",
-						"export: replay mode never settled to EDIT (saw %d) - not rendering",
-						game::replayMode());
+						"export: not rendering - the editor closed while waiting to start");
+					return;
+				}
+
+				// Say what we are waiting on, every 5s, so a long wait looks like
+				// a long wait rather than a hang.
+				if (now - s_pendLog >= 5000)
+				{
+					s_pendLog = now;
+					logger::write("info",
+						"export: waiting to start - mode=%s(%d)%s%s, %us elapsed",
+						gsig::replayModeName(mode), mode,
+						busy ? ", busy on " : "", busy ? busy : "",
+						(unsigned)((now - s_pendStart) / 1000));
+				}
+
+				if (now - s_pendStart > 300000)   // 5 min backstop
+				{
+					exporthook::clearPending();
+					s_pendWait = 0; s_pendStart = 0;
+					logger::write("info",
+						"export: giving up after 5 minutes - mode=%s(%d)%s%s. This is a "
+						"backstop against a hang, not a loading limit; if the editor was "
+						"still legitimately streaming, press Export again once it settles.",
+						gsig::replayModeName(mode), mode,
+						busy ? ", busy on " : "", busy ? busy : "");
 				}
 				return;
 			}
+			if (s_pendStart != 0)
+				logger::write("info", "export: replay ready after %us - starting",
+					(unsigned)((GetTickCount() - s_pendStart) / 1000));
+			s_pendStart = 0;
 
 			// Do not start until the playhead is at the beginning of the PROJECT.
 			//

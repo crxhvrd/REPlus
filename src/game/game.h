@@ -44,6 +44,11 @@ namespace game
 	// captured during this.
 	bool replayBusy();
 
+	// Names whichever sub-condition is keeping replayBusy() true; nullptr if
+	// none. For diagnostics - "busy" covers a loading screen, the loading flag
+	// and the streaming precache, which fail for different reasons.
+	const char* replayBusyReason();
+
 	// Ask the editor to close playback at its next safe point, the same way a
 	// finished bake does. Returns false when unresolved.
 	bool requestPlaybackClose();

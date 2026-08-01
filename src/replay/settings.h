@@ -135,7 +135,15 @@ namespace rsettings
 	void bindProject(const char* projectName);
 
 	// Flush to disk if anything changed. Cheap to call often.
+	//
+	// NOT cheap when it does write: the whole side-car is rewritten. Call it on
+	// events with a real deadline (project switch, shutdown), not on every value
+	// change - use tick() for that.
 	void save();
+
+	// Per-frame. Flushes once the store has been quiet for ~0.5s, so a held
+	// adjustment costs one write instead of one per input repeat.
+	void tick();
 
 	// Number of markers with non-default settings.
 	int count();

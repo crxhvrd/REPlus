@@ -921,8 +921,44 @@ namespace menu
 				g_menuKind, g_firstRow, g_rowCount, total);
 		}
 
+		// Does the row the cursor is on actually belong to us?
+		//
+		// The index alone is not enough, and assuming it was is a real bug people
+		// hit: g_shownKind and g_firstRow are only updated by OUR two populate
+		// hooks, so opening a submenu we do not hook - Audio, for one - leaves
+		// both stale. Focus then lands on the same index our header occupied and
+		// every ownership test passes, which is why stepping "Microphone Type"
+		// paged the Rockstar Editor+ row instead.
+		//
+		// So ask the live menu array rather than our own memory of it. Both
+		// populate paths stamp OURS_OPTION_ID into the option they push, and the
+		// game rebuilds that array for every menu, so a row carrying our id is
+		// one we put there during THIS populate.
+		//
+		// The index range is still checked: OURS_OPTION_ID is 0x27, which is also
+		// the stock HELP_TEXT id, so the id on its own could match a stock row.
+		// Neither test is sufficient alone; together they are.
+		bool ownsRow(int menuIndex)
+		{
+			if (g_rowCount <= 0 || g_firstRow < 0)            return false;
+			if (menuIndex < g_firstRow)                       return false;
+			if (menuIndex >= g_firstRow + g_rowCount)         return false;
+			if (!game::addr_g_MenuOptions)                    return false;
+
+			const int count = menuOptionCount();
+			if (menuIndex >= count)                           return false;
+
+			// Entry stride and the id at offset 0 are the same on both builds -
+			// see pushMenuOption, which writes through MenuArray on Enhanced and
+			// a 0x10-byte slot from ArrayGrow on Legacy.
+			auto* arr = (MenuArray*)game::addr_g_MenuOptions;
+			if (!arr->data)                                   return false;
+			return arr->data[menuIndex].id == (unsigned int)gsig::OURS_OPTION_ID;
+		}
+
 		int logicalAt(int menuIndex)
 		{
+			if (!ownsRow(menuIndex)) return ROW_GROUP;
 			const int i = menuIndex - g_firstRow;
 			return (i >= 0 && i < s_shown) ? s_rows[i] : ROW_GROUP;
 		}
@@ -1150,8 +1186,9 @@ namespace menu
 			const bool isToggle = (navCode == gsig::NAV_RIGHT || navCode == gsig::NAV_LEFT);
 			const int  focus    = game::addr_g_MenuFocusIndex
 				? *(int*)game::addr_g_MenuFocusIndex : -1;
-			const bool ours     = g_rowCount > 0 && g_firstRow >= 0 &&
-			                      focus >= g_firstRow && focus < g_firstRow + g_rowCount;
+			// ownsRow, not an index range: see its comment. A stale g_firstRow
+			// from a menu we do not hook otherwise makes us claim a stock row.
+			const bool ours     = ownsRow(focus);
 
 			// Accept on "Apply Shake to All". Two presses: the first arms, the
 			// second writes every marker. Checked before the header case below
@@ -1199,7 +1236,7 @@ namespace menu
 			// submenu rows above it open. Left/right work too - the row is
 			// drawn with arrows, so it should respond to them.
 			if (navCode == gsig::NAV_ACCEPT && g_shownKind == MENU_MARKER &&
-			    g_rowCount > 0 && g_firstRow >= 0 && focus == g_firstRow)
+			    ownsRow(focus) && focus == g_firstRow)
 			{
 				g_page = (g_page + 1) % PAGE_COUNT;
 				Config::get().writeInt("MenuExpanded", g_page);
@@ -1246,7 +1283,9 @@ namespace menu
 					if (handled)
 					{
 						rsettings::set(key, s);
-						rsettings::save();
+						// No save() here - set() dirties the store and
+						// rsettings::tick() flushes once the user stops. This ran
+						// on every input repeat and rewrote the whole side-car.
 						rebuildShownMenu(focus);
 						return;   // swallow: stock must not also step the type
 					}
@@ -1278,8 +1317,7 @@ namespace menu
 					MarkerSettings s = rsettings::get(key);
 
 					adjust(row, delta, s);
-					rsettings::set(key, s);
-					rsettings::save();
+					rsettings::set(key, s);   // flushed by rsettings::tick()
 
 					// The game refreshes a changed row by rebuilding the whole
 					// menu; do the same so ours re-renders and focus is kept.

@@ -40,9 +40,12 @@ through ScriptHookV there (the usual deferred-init detour cannot be placed in
 FiveM's address space); behaviour is otherwise identical.
 
 Two constraints. FiveM refuses any plugin that does not declare the running game
-build — the shipped ids cover every build it currently offers. And a build whose
-signatures have moved leaves the mod dormant rather than misbehaving:
-`no signature set for this build` in the log. Builds 3751 and 3889 are tested.
+build — the shipped ids cover every build it currently offers. And an older build
+loses whichever features its patterns no longer match, keeping the rest: every
+address resolves independently and each hook is guarded, so a miss disables that
+one feature and says so in the log. On b3258, for instance, world-collision
+disable and the profanity bypass are inert while the spline, shake, menu,
+distance leash and export all work. Builds 3751 and 3889 are tested.
 
 ---
 
