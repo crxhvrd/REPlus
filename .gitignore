@@ -28,18 +28,17 @@ x64/
 # ---------------------------------------------------------------------------
 # Runtime artefacts - written next to the game, but easy to drag in by mistake
 #
-# The two .ini files at the REPO ROOT are sources, not artefacts: CMake copies
-# both next to the built .asi, so ignoring them would break a fresh clone's
-# build. Only the copies that appear elsewhere are excluded.
+# The .ini files are GENERATED: their text lives in CMakeLists.txt and the build
+# writes them next to the .asi. None of them belongs in the repo, wherever a
+# copy turns up - a tracked one would drift from the generator and collect
+# whatever settings were last tested in-game.
 # ---------------------------------------------------------------------------
 *.log
 Captures/
 markers/
 ffmpeg.exe
-*/Render.ini
-*/RockstarEditorPlus.ini
-!/Render.ini
-!/RockstarEditorPlus.ini
+RockstarEditorPlus.ini
+Render.ini
 
 # presets\ is a runtime folder next to the game, EXCEPT the shipped set under
 # dist\ - the README names those five by name, so a clone needs them.
