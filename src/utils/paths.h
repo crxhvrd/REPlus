@@ -90,13 +90,65 @@ namespace paths
 		return d;
 	}
 
+	namespace detail
+	{
+		// Can we actually create files in there? CreateDirectory succeeding is
+		// not the same answer - the folder may already exist and be read-only.
+		inline bool writable(const std::string& dir)
+		{
+			CreateDirectoryA(dir.c_str(), nullptr);
+			const std::string probe = dir + "write.test";
+			HANDLE h = CreateFileA(probe.c_str(), GENERIC_WRITE, 0, nullptr,
+			                       CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY |
+			                       FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+			if (h == INVALID_HANDLE_VALUE) return false;
+			CloseHandle(h);   // FILE_FLAG_DELETE_ON_CLOSE removes it for us
+			return true;
+		}
+
+		inline std::string localAppData()
+		{
+			char p[MAX_PATH]{};
+			if (!GetEnvironmentVariableA("LOCALAPPDATA", p, MAX_PATH)) return {};
+			std::string s = p;
+			if (!s.empty() && s.back() != '\\') s += '\\';
+			return s;
+		}
+	}
+
+	// True when the folder below had to fall back out of the .asi's directory.
+	// Read after logging is up so the reason can be reported - see main.cpp.
+	inline bool& usingFallbackDir() { static bool b = false; return b; }
+
 	// "<asi folder>\RockstarEditorPlus\" — created on first use.
+	//
+	// Falls back to %LOCALAPPDATA%\RockstarEditorPlus\ when that is not
+	// writable, which is the normal case for a game installed under
+	// Program Files: the process is 64-bit so there is no UAC file
+	// virtualisation to redirect the writes, they simply fail.
+	//
+	// Without the fallback the failure is near-undiagnosable: no Captures
+	// folder, no ini write-back, ffmpeg unable to produce output, and - worst -
+	// NO LOG, so the user reports "nothing happens" and has nothing to send.
+	// The alternative advice is "run the game as administrator", which is a poor
+	// thing to ask for a screenshot tool.
 	inline const std::string& baseDir()
 	{
 		static const std::string d = [] {
 			std::string b = asiDir() + "RockstarEditorPlus\\";
-			CreateDirectoryA(b.c_str(), nullptr);
-			return b;
+			if (detail::writable(b)) return b;
+
+			const std::string local = detail::localAppData();
+			if (!local.empty())
+			{
+				std::string alt = local + "RockstarEditorPlus\\";
+				if (detail::writable(alt))
+				{
+					usingFallbackDir() = true;
+					return alt;
+				}
+			}
+			return b;   // nothing worked; keep the intended path so the log names it
 		}();
 		return d;
 	}

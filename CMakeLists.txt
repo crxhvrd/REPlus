@@ -253,3 +253,24 @@ endif()
 
 target_link_directories(RockstarEditorPlus PUBLIC "${CMAKE_BINARY_DIR}/LIB")
 target_link_libraries(RockstarEditorPlus version.lib shell32.lib debug minhook.x64d.lib optimized minhook.x64.lib)
+
+# =============================================================================
+#  Preset Maker - a small GUI for authoring encoder presets
+# =============================================================================
+#  Separate executable, not part of the .asi. Encoder presets are two-line inis
+#  that are easy to write and easy to get subtly wrong: a container that cannot
+#  hold the chosen codec makes ffmpeg refuse, and the render then produces
+#  nothing for a reason the user never sees. The tool makes that pairing
+#  impossible to express.
+#
+#  Win32 with no dependencies and the same static CRT as the .asi, so it runs
+#  from the bundle on a machine with nothing installed.
+# =============================================================================
+add_executable(PresetMaker WIN32 tools/presetmaker/presetmaker.cpp)
+set_target_properties(PresetMaker PROPERTIES
+    OUTPUT_NAME "RE+ Preset Maker"
+    RUNTIME_OUTPUT_DIRECTORY         "${CMAKE_BINARY_DIR}/BIN/"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_BINARY_DIR}/BIN/Debug/"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/BIN/Release/"
+)
+target_compile_options(PresetMaker PRIVATE /utf-8)

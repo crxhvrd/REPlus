@@ -182,6 +182,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 		// missing.
 		logger::write("info", "RockstarEditorPlus: attached (build " __DATE__ " " __TIME__ ")");
 
+		if (paths::usingFallbackDir())
+			logger::write("info",
+				"RockstarEditorPlus: the folder beside the .asi is not writable, so "
+				"settings, logs and renders are in %s instead. That is normal for a "
+				"game installed under Program Files. Nothing needs administrator "
+				"rights; set RenderOutputFolder in Render.ini if you want renders "
+				"somewhere specific.",
+				paths::baseDir().c_str());
+
 		// Decide whether this process is ours BEFORE touching it.
 		//
 		// This check also exists in the deferred trampoline below, but there it

@@ -274,14 +274,22 @@ Both files live in `RockstarEditorPlus\`, beside the `.asi`.
 GTA5.exe
 RockstarEditorPlus.asi
 RockstarEditorPlus\
-    RockstarEditorPlus.ini      camera, shake, limits
-    Render.ini                  rendering
+    RockstarEditorPlus.ini          camera, shake, limits
+    Render.ini                      rendering
+    RE+ Render Settings.exe         editor for both of the above
     RockstarEditorPlus.log
-    ffmpeg.exe                  bundled
-    presets\                    codec presets
-    markers\                    per-marker settings
-    Captures\render_0001\       frames, or video.mp4
+    ffmpeg.exe                      bundled
+    presets\                        codec presets
+    markers\                        per-marker settings
+    Captures\render_0001\           frames, or video.mp4
 ```
+
+**RE+ Render Settings** is a standalone editor for the render settings and the
+encoder presets, sitting next to the files it edits. Every setting carries its
+own explanation, and choosing a codec narrows the container and pixel-format
+lists to the ones that actually work — a container that cannot hold the codec
+makes ffmpeg refuse, and that failure is otherwise invisible. It writes
+line-by-line, so the comments in the ini survive being edited through it.
 
 Paths resolve from the `.asi`, not from the game executable — under FiveM that
 puts everything in `plugins\RockstarEditorPlus\`. Set `RenderOutputFolder` to an
