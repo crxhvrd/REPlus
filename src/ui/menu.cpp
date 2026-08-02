@@ -73,9 +73,75 @@ namespace menu
 		constexpr unsigned long long kSfNeedsRelease = 0x40;
 
 		// ms_activeMenuOptions element and header. Identical on both builds.
-		struct MenuOption { unsigned int id; unsigned int pad; unsigned int toggleCount; };
+		//
+		// The middle dword was called `pad` and is nothing of the sort - it is
+		// CVideoEditorPlayback::MenuOption::m_editRestrictions, and writing it is
+		// how a row is disabled. Confirmed in the retail decompile of
+		// PopulateCameraMenu, which stores IS_ENDPOINT there for the Camera Type
+		// row on the last marker, and again in UpdateMenuHelpText, which reads
+		// +0 as the option and +4 as the restriction at a 0xC stride. See the
+		// EDIT_RESTRICTION_* block in signatures.h for what the game then does
+		// with it - three separate disable paths, all for one field.
+		struct MenuOption { unsigned int id; unsigned int restriction; unsigned int toggleCount; };
 		struct MenuArray  { MenuOption* data; unsigned short count; unsigned short cap; };
 		static_assert(sizeof(MenuOption) == 12, "MenuOption must stay 12 bytes");
+
+		constexpr int kVideoEditorClass = 9; // SF_BASE_CLASS_VIDEO_EDITOR
+
+		// ---------------------------------------------------------------------
+		// One Scaleform method call, per build.
+		//
+		// Factored out of addRow() because the help-text path needs exactly the
+		// same sequence, and the two builds disagree about all of it: Enhanced
+		// threads a caller-owned context through Begin/End and has a conditional
+		// release afterwards, Legacy has none of that. Keeping one copy is what
+		// stops the second caller from quietly getting the Legacy shape on
+		// Enhanced.
+		// ---------------------------------------------------------------------
+		struct SfMethod
+		{
+			SfCtx ctx{};
+			bool  open = false;
+
+			bool begin(const char* method)
+			{
+				if (!game::addr_BeginMethod || !game::addr_g_MovieId) return false;
+				const int movie = *(int*)game::addr_g_MovieId;
+
+				open = ((FnBeginMethod)game::addr_BeginMethod)(
+					movie, kVideoEditorClass, method, -1,
+					game::isEnhanced() ? (void*)&ctx : (void*)(intptr_t)-1) != 0;
+				return open;
+			}
+
+			// Strings only. Integer params are INLINED into a global param array
+			// on Enhanced, so there is no AddParamInt to call there - which is
+			// fine, because every method we issue takes strings.
+			void param(const char* s)
+			{
+				if (open && game::addr_AddParamString)
+					((FnAddParamStr)game::addr_AddParamString)(s, false);
+			}
+
+			void end()
+			{
+				if (!open) return;
+				open = false;
+
+				if (game::isEnhanced())
+				{
+					((FnEndMethodEnh)game::addr_EndMethod)(&ctx, 0, 0);
+					// Stock code does this after every EndMethod. Skipping it
+					// leaks or corrupts Scaleform state.
+					if ((ctx.flags & kSfNeedsRelease) && game::addr_ScaleformRelease)
+						((FnSfRelease)game::addr_ScaleformRelease)(ctx.a, &ctx, ctx.c);
+				}
+				else
+				{
+					((FnEndMethod)game::addr_EndMethod)(false);
+				}
+			}
+		};
 
 		FnPopulate    origPopulate       = nullptr;
 		FnPopulate    origPopulateMarker = nullptr;
@@ -106,8 +172,6 @@ namespace menu
 		// UpdateShakeType wraps there, so 0..5 is everything the game can hold.
 		constexpr int kShakeNone = 0;
 		constexpr int kShakeLast = 5;   // EXPLOSION
-
-		constexpr int kVideoEditorClass = 9; // SF_BASE_CLASS_VIDEO_EDITOR
 
 		using rsettings::Param;
 		using rsettings::MarkerSettings;
@@ -204,6 +268,12 @@ namespace menu
 		{
 			return row >= ROW_COLLISION && row <= ROW_G_PROFILE;
 		}
+
+		// An ACTION row: accept performs it, and there is no value to show.
+		// Drawn with ADD_COLUMN_ITEM, exactly like the stock "Edit Camera" row,
+		// so it carries no arrows to suggest otherwise. Its state lives in the
+		// help line, which is where a row with no value column has to put it.
+		inline bool isActionRow(int row) { return row == ROW_APPLY_ALL; }
 
 		// Two presses to fire, because this overwrites the shake settings on
 		// every marker in the project and there is no undo. Armed by the first
@@ -462,16 +532,12 @@ namespace menu
 				}
 			}
 			if (row == ROW_STEP) return kStepText[s_step];
-			if (row == ROW_APPLY_ALL)
-			{
-				if (s_applyArmed)     return "Accept again";
-				if (s_appliedTo >= 0)
-				{
-					snprintf(buf, sizeof(buf), "Done: %d marker(s)", s_appliedTo);
-					return buf;
-				}
-				return "Accept";
-			}
+
+			// Action rows have no value element at all - they are added with
+			// ADD_COLUMN_ITEM, like the stock "Edit Camera". Null is the signal
+			// for that, both to addRow() and to the in-place refresh. Their
+			// armed/done state lives in the help line instead; see rowHelp().
+			if (isActionRow(row)) return nullptr;
 			// Simple mode reads its default from the ini when the marker has no
 			// override, exactly like every other row - so what is displayed is
 			// what will actually run, not the sentinel behind it.
@@ -562,6 +628,168 @@ namespace menu
 			case ROW_G_PROFILE: return 3;
 			default: return -1;
 			}
+		}
+
+		// -------------------------------------------------------------------------
+		// The help line for one of our rows.
+		//
+		// Vanilla looks a text key up in sc_EditMarkerMenuHelpText, indexed by the
+		// option id, and hands TheText.Get's result to UPDATE_COLUMN_HELP_TEXT. Our
+		// rows all carry MARKER_MENU_OPTION_HELP_TEXT, whose entry in that array is
+		// the empty string - which is exactly why they showed a blank help line for
+		// as long as they existed.
+		//
+		// UPDATE_COLUMN_HELP_TEXT takes a LOCALIZED STRING rather than a key, so
+		// these go straight through with nothing added to the game's string table.
+		// English only, deliberately: the alternative is shipping a text-table patch
+		// per language, and a wrong-language help line is worse than an English one.
+		//
+		// A restricted row MUST answer here, because the reason is the whole point
+		// of disabling it - see rowRestriction().
+		// -------------------------------------------------------------------------
+		const char* rowHelp(int row)
+		{
+			static char buf[192];
+			const Config& c = Config::get();
+
+			switch (row)
+			{
+			case ROW_GROUP:
+				return g_ourShakeHere
+					? "Which group of Rockstar Editor+ settings this marker shows."
+					: "Which group of Rockstar Editor+ settings this marker shows. "
+					  "Set the Shake row to Rockstar Editor+ to reach the shake pages.";
+			case ROW_STEP:
+				return "How far one press of left or right moves a value on this page.";
+
+			case ROW_PATH:
+				return "Whether this segment follows the curve. Default uses the ini; "
+				       "Stock hands this one segment back to the game.";
+			case ROW_ROT:
+				return "Whether this segment's camera rotation is splined. "
+				       "Default uses the ini.";
+			case ROW_TENSION:
+				return c.naturalPacing
+					? "No effect under Natural pacing: the path is then driven from the "
+					  "marker times and has no knot spacing to choose. Set Speed Profile "
+					  "to Continuous or Per Segment first."
+					: "How tightly the curve is pulled around this marker. "
+					  "0 sweeps wide, 1 hugs the marks.";
+			case ROW_EASE_IN:
+				return "Fraction of this segment spent accelerating out of the marker. "
+				       "Overrides the cross-marker speed profile.";
+			case ROW_EASE_OUT:
+				return "Fraction of this segment spent decelerating into the next marker.";
+
+			case ROW_SHAKE_MODE:
+				return "Simple drives one amplitude and one frequency. Complex exposes "
+				       "the Sway and Jitter layers directly.";
+			case ROW_INTENSITY:
+				return "Shake size, in DEGREES of rotation (and 5 cm of movement per "
+				       "degree). 2.0 to 2.5 reads as handheld.";
+			case ROW_FREQ_MUL:
+				return "Shake rate in HERTZ, for the slow layer. 0.35 is a three-second "
+				       "wander; 0.20 is slower.";
+			case ROW_VARIATION:
+				return "How much the shake swells and settles over time. 0 is "
+				       "statistically flat second after second.";
+			case ROW_SPEED_AMP:
+				return "Extra shake amplitude when the camera is moving fast. About 1.0 "
+				       "is the single biggest step towards an operator rather than an effect.";
+			case ROW_SPEED_FREQ:
+				return "Extra shake rate when the camera is moving fast.";
+			case ROW_STOP_STILL:
+				return "Fade the shake out while the camera is parked.";
+
+			case ROW_SWAY_POS:   return "Slow layer: movement, in metres.";
+			case ROW_SWAY_ROT:   return "Slow layer: rotation, in degrees. This is what sells handheld.";
+			case ROW_SWAY_FREQ:  return "Slow layer rate, in hertz.";
+			case ROW_JIT_POS:    return "Fast layer: movement, in metres. Engine buzz and rattle.";
+			case ROW_JIT_ROT:    return "Fast layer: rotation, in degrees.";
+			case ROW_JIT_FREQ:   return "Fast layer rate, in hertz. Wants to be well clear of the slow one.";
+			case ROW_ROUGH:      return "Octaves of detail within each shake layer.";
+			case ROW_SEED:       return "Reroll the shake without changing its character.";
+
+			case ROW_AX_LAT:     return "Weight on side-to-side movement. 0 disables that axis.";
+			case ROW_AX_FWD:     return "Weight on forward movement. Reads as a zoom pump, so it ships lower.";
+			case ROW_AX_VERT:    return "Weight on vertical movement. 0 disables that axis.";
+			case ROW_AX_PITCH:   return "Weight on pitch. 0 disables that axis.";
+			case ROW_AX_ROLL:    return "Weight on roll. Moves the corners rather than the centre.";
+			case ROW_AX_YAW:     return "Weight on yaw. 0 disables that axis.";
+
+			case ROW_APPLY_ALL:
+				if (s_applyArmed)
+					return "Press again to copy THIS marker's shake onto every marker in "
+					       "the project. There is no undo.";
+				if (s_appliedTo >= 0)
+				{
+					snprintf(buf, sizeof(buf),
+						"Copied this marker's shake onto %d marker(s). Curve and easing "
+						"were left alone.", s_appliedTo);
+					return buf;
+				}
+				return "Copy this marker's shake settings onto every marker in the "
+				       "project. Shake only.";
+
+			// --- global rows, top-level marker menu ---
+			case ROW_G_HEADER:
+				return "Rockstar Editor+ settings for the whole session. Accept pages "
+				       "through Curve and Limits.";
+			case ROW_G_PATH:  return "Replace the marker-to-marker camera PATH with a curve.";
+			case ROW_G_ROT:   return "Replace the marker-to-marker camera ROTATION with a curve.";
+			case ROW_G_FOV:   return "Replace the marker-to-marker ZOOM blend with a curve.";
+			case ROW_G_ALPHA:
+				return c.naturalPacing
+					? "No effect under Natural pacing: a time-driven path has no knot "
+					  "spacing to choose. Change Speed Profile first."
+					: "How tightly the curve is pulled around each marker. If a shot "
+					  "loops where it doubles back, try Uniform.";
+			case ROW_G_PROFILE:
+				return "Natural paces the shot from the marker times. Continuous fits one "
+				       "speed curve across all markers. Per Segment paces each on its own.";
+			case ROW_COLLISION:
+				return "Off lets the camera pass through geometry, which also stops the "
+				       "push-off bending the path away from your markers.";
+			case ROW_DISTANCE:
+				return "Lift the editor's 30 m leash from the player. Far out you will "
+				       "see LOD pop - that is streaming, not this.";
+			case ROW_ZOOM:
+				return "Widen the editor's zoom range beyond the stock 0.45x-4.50x. "
+				       "The ends are set in the ini.";
+			default:
+				return "";
+			}
+		}
+
+		// -------------------------------------------------------------------------
+		// Is this row disabled, and why?
+		//
+		// This is the game's own mechanism, and writing one dword buys three
+		// behaviours we would otherwise have to fake: UpdateEditMenuState greys the
+		// row, SetCurrentItemIntoCorrectState draws it without arrows, and the stock
+		// input dispatcher plays ERROR on accept instead of acting. See the
+		// EDIT_RESTRICTION_* block in signatures.h.
+		//
+		// Gated on the help-text hook having resolved. A disabled row whose reason
+		// we cannot state falls back to the GAME's restriction string, which
+		// describes something else entirely ("first person camera"), and a greyed
+		// row with a misleading explanation is worse than a live one that quietly
+		// does nothing. So on a build where the hook is missing, nothing is greyed.
+		// -------------------------------------------------------------------------
+		constexpr unsigned int kOurRestriction = gsig::EDIT_RESTRICTION_CAMERA_BLOCKED;
+
+		unsigned int rowRestriction(int row)
+		{
+			if (!game::addr_UpdateMenuHelpText) return gsig::EDIT_RESTRICTION_NONE;
+
+			// Curve Shape reaches nothing under Natural pacing - the path is then
+			// a Hermite over the marker times, which has no knot spacing. The
+			// value still moves and the camera does not, which is exactly the
+			// sort of question this field exists to answer.
+			if ((row == ROW_TENSION || row == ROW_G_ALPHA) && Config::get().naturalPacing)
+				return kOurRestriction;
+
+			return gsig::EDIT_RESTRICTION_NONE;
 		}
 
 		// --- editing -----------------------------------------------------------
@@ -755,7 +983,7 @@ namespace menu
 
 		int menuOptionCount() { return *(unsigned short*)(game::addr_g_MenuOptions + 8); }
 
-		void pushMenuOption(int toggleCount)
+		void pushMenuOption(int toggleCount, unsigned int restriction)
 		{
 			if (!game::isEnhanced())
 			{
@@ -763,7 +991,7 @@ namespace menu
 					(void*)game::addr_g_MenuOptions, 0x10);
 				if (!slot) return;
 				slot[0] = (unsigned int)gsig::OURS_OPTION_ID;
-				slot[1] = 0;
+				slot[1] = restriction;
 				slot[2] = (unsigned int)toggleCount;
 				return;
 			}
@@ -792,47 +1020,42 @@ namespace menu
 			}
 
 			arr->data[arr->count].id          = (unsigned int)gsig::OURS_OPTION_ID;
-			arr->data[arr->count].pad         = 0;
+			arr->data[arr->count].restriction = restriction;
 			arr->data[arr->count].toggleCount = (unsigned int)toggleCount;
 			arr->count += 1;
 		}
 
-		void addRow(const char* label, const char* value, int toggleCount)
+		// A row. `value` null makes it an ACTION row rather than a value row -
+		// the same distinction the stock menu draws with ADD_COLUMN_ITEM for
+		// "Edit Camera" and ADD_COLUMN_ITEM_WITH_OPTIONS for everything that
+		// carries a value. An action row has no value element and no arrows, so
+		// there is nothing for left/right to appear to do.
+		//
+		// Literal strings, not TheText.Get - our keys do not exist in the game's
+		// string table, so it would hand back blanks.
+		void addRow(const char* label, const char* value, int toggleCount,
+		            unsigned int restriction)
 		{
-			const int movie = *(int*)game::addr_g_MovieId;
+			SfMethod m;
+			if (!m.begin(value ? "ADD_COLUMN_ITEM_WITH_OPTIONS" : "ADD_COLUMN_ITEM"))
+				return;
 
-			// Literal strings, not TheText.Get - our keys do not exist in the
-			// game's string table, so it would hand back blanks.
-			if (game::isEnhanced())
-			{
-				SfCtx ctx{};
-				if (!((FnBeginMethod)game::addr_BeginMethod)(
-						movie, kVideoEditorClass, "ADD_COLUMN_ITEM_WITH_OPTIONS",
-						-1, &ctx))
-					return;
+			m.param(label);
+			if (value) m.param(value);
+			m.end();
 
-				((FnAddParamStr)game::addr_AddParamString)(label, false);
-				((FnAddParamStr)game::addr_AddParamString)(value, false);
-				((FnEndMethodEnh)game::addr_EndMethod)(&ctx, 0, 0);
+			pushMenuOption(toggleCount, restriction);
+		}
 
-				// Stock code does this after every EndMethod. Skipping it leaks
-				// or corrupts Scaleform state.
-				if ((ctx.flags & kSfNeedsRelease) && game::addr_ScaleformRelease)
-					((FnSfRelease)game::addr_ScaleformRelease)(ctx.a, &ctx, ctx.c);
-			}
-			else
-			{
-				if (!((FnBeginMethod)game::addr_BeginMethod)(
-						movie, kVideoEditorClass, "ADD_COLUMN_ITEM_WITH_OPTIONS",
-						-1, (void*)(intptr_t)-1))
-					return;
-
-				((FnAddParamStr)game::addr_AddParamString)(label, false);
-				((FnAddParamStr)game::addr_AddParamString)(value, false);
-				((FnEndMethod)game::addr_EndMethod)(false);
-			}
-
-			pushMenuOption(toggleCount);
+		// Set the help line under the column. Takes a LOCALIZED string, not a
+		// text key - which is the whole reason our rows can have help text at
+		// all without an entry in the game's string table.
+		void emitHelpText(const char* text)
+		{
+			SfMethod m;
+			if (!m.begin("UPDATE_COLUMN_HELP_TEXT")) return;
+			m.param(text ? text : "");
+			m.end();
 		}
 
 		// Does this Scaleform method add a row to the column?
@@ -901,7 +1124,8 @@ namespace menu
 			for (int i = 0; i < s_shown; ++i)
 			{
 				const int row = s_rows[i];
-				addRow(rowLabel(row), valueText(row, s), optionCount(row));
+				addRow(rowLabel(row), valueText(row, s), optionCount(row),
+				       rowRestriction(row));
 			}
 			g_rowCount = menuOptionCount() - g_firstRow;
 
@@ -954,6 +1178,31 @@ namespace menu
 			auto* arr = (MenuArray*)game::addr_g_MenuOptions;
 			if (!arr->data)                                   return false;
 			return arr->data[menuIndex].id == (unsigned int)gsig::OURS_OPTION_ID;
+		}
+
+		// Is the row under the cursor the STOCK Shake row, right now?
+		//
+		// g_shakeRow on its own is not enough, for precisely the reason ownsRow()
+		// above exists. It is written only by our populate hooks, so a submenu we
+		// do NOT hook - Audio, for one - leaves it pointing at whatever index the
+		// camera menu last drew the Shake row at. Focus landing there then takes
+		// the shake-preset branch in hkMenuInput, and the common case is the bad
+		// one: a marker sitting on MARKER_SHAKE_NONE stepped LEFT gets silently
+		// switched onto our preset, with the keypress swallowed so the stock row
+		// the user was actually on does not step either.
+		//
+		// Same fix ownsRow got: ask the live option array, which the game rebuilds
+		// for every menu. The remembered index stays as the other half of the
+		// test - the id proves it is a Shake row, the index proves it is the one
+		// this populate drew.
+		bool focusIsStockShakeRow(int menuIndex)
+		{
+			if (menuIndex < 0 || menuIndex != g_shakeRow) return false;
+			if (!game::addr_g_MenuOptions)                return false;
+
+			auto* arr = (const MenuArray*)game::addr_g_MenuOptions;
+			if (!arr->data || menuIndex >= menuOptionCount()) return false;
+			return arr->data[menuIndex].id == (unsigned int)gsig::OPT_CAMERA_SHAKE;
 		}
 
 		int logicalAt(int menuIndex)
@@ -1115,6 +1364,44 @@ namespace menu
 			((FnPopulate)fn)((unsigned int)focus);
 		}
 
+		// -------------------------------------------------------------------------
+		// Refresh ONE row in place, which is what the stock menu actually does for
+		// a value change.
+		//
+		// Vanilla only rebuilds a column when the SET of rows changes; an ordinary
+		// left/right calls UpdateItemTextValue on the focused row and re-runs the
+		// help text, and that is all. Every one of our steps used to re-run the
+		// whole populate - freeing and refilling the option array and re-issuing
+		// every Scaleform call in the column - and a held key repeats around thirty
+		// times a second.
+		//
+		// Action rows are skipped: they were added with ADD_COLUMN_ITEM and have no
+		// value element for UPDATE_LIST_ITEM_ELEMENT to write into. Their state is
+		// in the help line, which is refreshed either way.
+		// -------------------------------------------------------------------------
+		void refreshRow(int menuIndex, int row, const MarkerSettings& s)
+		{
+			if (const char* value = valueText(row, s))
+			{
+				if (game::addr_UpdateItemText)
+					((FnUpdateText)game::addr_UpdateItemText)(menuIndex, value);
+			}
+			emitHelpText(rowHelp(row));
+		}
+
+		// Does stepping this row change WHICH rows exist, or whether one of them is
+		// ENABLED? Only those need the column rebuilt.
+		//
+		// The greying is applied by the game's own UpdateEditMenuState, which runs
+		// at the end of a populate and nowhere else - so a restriction that changes
+		// has to go through one, even though no row appeared or disappeared.
+		inline bool rowChangesLayout(int row)
+		{
+			return row == ROW_GROUP        // switches the whole group
+			    || row == ROW_G_HEADER     // pages the global block
+			    || row == ROW_G_PROFILE;   // decides whether Curve Shape is greyed
+		}
+
 		// `b` is pointer-sized so Enhanced's context pointer survives the
 		// pass-through untouched - see FnBeginMethod.
 		char __fastcall hkBeginMethod(int movie, int cls, const char* method, int a, void* b)
@@ -1181,6 +1468,43 @@ namespace menu
 			return origBeginMethod(movie, cls, method, a, b);
 		}
 
+		// -------------------------------------------------------------------------
+		// The help line.
+		//
+		// CVideoEditorPlayback::UpdateMenuHelpText is the single choke point every
+		// focus change goes through - the tail of each Populate*, the focus-change
+		// block in the input dispatcher, and the mouse hover path all call it. So
+		// hooking it covers every route by construction, the same argument that put
+		// the spinner hook on the callee rather than its wrapper.
+		//
+		// For a stock row we stand aside entirely. For one of ours the original
+		// would look up sc_EditMarkerMenuHelpText[MARKER_MENU_OPTION_HELP_TEXT],
+		// which is the empty string - so it would blank the line, which is what it
+		// has always done.
+		// -------------------------------------------------------------------------
+		using FnUpdateHelp = void(__fastcall*)(unsigned int);
+		FnUpdateHelp origUpdateMenuHelpText = nullptr;
+
+		void __fastcall hkUpdateMenuHelpText(unsigned int menuIndex)
+		{
+			if (ownsRow((int)menuIndex))
+			{
+				emitHelpText(rowHelp(logicalAt((int)menuIndex)));
+				return;
+			}
+			origUpdateMenuHelpText(menuIndex);
+		}
+
+		// Re-run the help line for whatever is focused now. Used after we change a
+		// row's own state without moving focus, which is the one case the game
+		// never has to handle for itself.
+		void refreshHelpForFocus()
+		{
+			if (!game::addr_g_MenuFocusIndex) return;
+			const int focus = *(int*)game::addr_g_MenuFocusIndex;
+			if (ownsRow(focus)) emitHelpText(rowHelp(logicalAt(focus)));
+		}
+
 		void __fastcall hkMenuInput(int navCode)
 		{
 			const bool isToggle = (navCode == gsig::NAV_RIGHT || navCode == gsig::NAV_LEFT);
@@ -1213,7 +1537,10 @@ namespace menu
 							? applyShakeToAll(rsettings::get(rmarker::timeMs(marker)))
 							: 0;
 					}
-					rebuildShownMenu(focus);
+					// An action row has no value element - its state IS the help
+					// line, so that is the only thing to redraw. No rebuild:
+					// nothing about the column changed.
+					refreshHelpForFocus();
 					return;   // swallow: the row is ours, stock has no such row
 				}
 				// Left/right on an action row do nothing, but they must still be
@@ -1221,8 +1548,7 @@ namespace menu
 				// happens to sit at this index.
 				if (isToggle)
 				{
-					s_applyArmed = false;
-					rebuildShownMenu(focus);
+					if (s_applyArmed) { s_applyArmed = false; refreshHelpForFocus(); }
 					return;
 				}
 			}
@@ -1249,8 +1575,7 @@ namespace menu
 			// see MarkerSettings::ourShake for why a real 7th m_shakeType is not
 			// an option. Stepping onto it parks the marker on MARKER_SHAKE_NONE
 			// so the game applies no shake of its own and ours takes over.
-			if (isToggle && g_shownKind == MENU_CAMERA &&
-			    g_shakeRow >= 0 && focus == g_shakeRow)
+			if (isToggle && g_shownKind == MENU_CAMERA && focusIsStockShakeRow(focus))
 			{
 				void* marker = currentMarker();
 				if (marker)
@@ -1298,6 +1623,15 @@ namespace menu
 				const int row   = logicalAt(focus);
 				const int delta = (navCode == gsig::NAV_RIGHT) ? 1 : -1;
 
+				// A disabled row ignores left and right, exactly as a restricted
+				// stock row does - the game's dispatcher gates its whole toggle
+				// switch on IsEnabled(). It cannot do that for us, because our
+				// rows never reach it: we swallow them here first. So the same
+				// test has to be made here, or a row drawn greyed and without
+				// arrows would still quietly change its value.
+				if (rowRestriction(row) != gsig::EDIT_RESTRICTION_NONE)
+					return;   // swallow: still our row, just not a live one
+
 				// Global rows and the two UI rows write config or scratch state,
 				// so they need no marker at all. Keeping them off the per-marker
 				// path also means they still work on a marker we would otherwise
@@ -1306,7 +1640,9 @@ namespace menu
 				{
 					MarkerSettings ignored{};
 					adjust(row, delta, ignored);
-					rebuildShownMenu(focus);
+
+					if (rowChangesLayout(row)) rebuildShownMenu(focus);
+					else                       refreshRow(focus, row, ignored);
 					return;
 				}
 
@@ -1319,9 +1655,12 @@ namespace menu
 					adjust(row, delta, s);
 					rsettings::set(key, s);   // flushed by rsettings::tick()
 
-					// The game refreshes a changed row by rebuilding the whole
-					// menu; do the same so ours re-renders and focus is kept.
-					rebuildShownMenu(focus);
+					// One row changed, so redraw one row - which is what the
+					// stock menu does for a value step. Rebuilding the whole
+					// column was re-issuing every Scaleform call in it on every
+					// input repeat, around thirty times a second on a held key.
+					if (rowChangesLayout(row)) rebuildShownMenu(focus);
+					else                       refreshRow(focus, row, s);
 				}
 				return; // swallow - never let our rows reach the stock switch
 			}
@@ -1357,11 +1696,20 @@ namespace menu
 		if (game::addr_PopulateMarkerMenu)
 			memory(game::addr_PopulateMarkerMenu).hook(hkPopulateMarker, &origPopulateMarker);
 
-		// "relabel" is UpdateItemTextValue: no longer used for help text, but
-		// still what rewrites the stock Shake row's value for our preset.
-		logger::write("info", "menu: rows injected (relabel=%s, global=%s)",
-			game::addr_UpdateItemText     ? "yes" : "no",
-			game::addr_PopulateMarkerMenu ? "yes" : "no");
+		// Optional: without it our rows keep the blank help line they had
+		// before, and rowRestriction() stops greying anything - see the note
+		// there on why a reason we cannot state is worse than no greying.
+		if (game::addr_UpdateMenuHelpText)
+			memory(game::addr_UpdateMenuHelpText).hook(hkUpdateMenuHelpText,
+			                                          &origUpdateMenuHelpText);
+
+		// UpdateItemTextValue does two jobs now: it rewrites the stock Shake
+		// row's value for our preset, and it is the in-place row refresh that
+		// replaced rebuilding the whole column on every left/right.
+		logger::write("info", "menu: rows injected (itemText=%s, help=%s, global=%s)",
+			game::addr_UpdateItemText      ? "yes" : "no",
+			game::addr_UpdateMenuHelpText  ? "yes" : "no",
+			game::addr_PopulateMarkerMenu  ? "yes" : "no");
 	}
 }
 

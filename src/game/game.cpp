@@ -37,6 +37,15 @@ namespace game
 	uintptr_t addr_g_LoadingScreen     = 0;
 	uintptr_t addr_g_PreCaching        = 0;
 	uintptr_t addr_ReplayJumpTo        = 0;
+	uintptr_t addr_SetupReplayBuffer   = 0;
+	uintptr_t addr_IsPlaybackFlagSet   = 0;
+	uintptr_t addr_g_ReplayBufferInfo  = 0;
+	uintptr_t addr_g_ReplayBlocks      = 0;
+	uintptr_t addr_g_ReplayTotalBlocks = 0;
+	uintptr_t addr_g_ReplayAllocator   = 0;
+	uintptr_t addr_ReplayHeapAllocImm  = 0;
+	uintptr_t addr_ReplayHeapCtorImm   = 0;
+	bool      replayHeapWidenedEarly   = false;
 	uintptr_t addr_SetCursorSpeed      = 0;
 	uintptr_t addr_SetNextPlayBackState= 0;
 	uintptr_t addr_g_ReplayMode        = 0;
@@ -53,6 +62,7 @@ namespace game
 	uintptr_t addr_g_MenuOptions        = 0;
 	uintptr_t addr_g_MenuFocusIndex     = 0;
 	uintptr_t addr_UpdateItemText       = 0;
+	uintptr_t addr_UpdateMenuHelpText   = 0;
 	uintptr_t addr_g_EditMarkerIndex    = 0;
 
 	// Enhanced-only. Legacy leaves these 0 and never reads them: it has a real
@@ -298,6 +308,74 @@ namespace game
 		return a;
 	}
 
+	uintptr_t addr_g_Project = 0;
+
+	// The open project's name, validated rather than trusted.
+	//
+	// The montage offset is derived (see signatures.h), and a derived offset is
+	// exactly the kind of thing that goes stale on a game update - so check that
+	// what came back actually looks like a name before handing it to anything
+	// that will build a filename out of it. A wrong offset then costs the
+	// caller a null and a fallback, instead of putting arbitrary bytes into a
+	// path.
+	const char* projectName()
+	{
+		if (!addr_g_Project) return nullptr;
+
+		const auto* project = *(const unsigned char* const*)addr_g_Project;
+		if (!project) return nullptr;
+
+		const auto* montage = *(const unsigned char* const*)(project + gsig::PROJECT_MONTAGE_OFF);
+		if (!montage) return nullptr;
+
+		const char* name = (const char*)(montage + gsig::MONTAGE_NAME_OFF);
+
+		// Printable, NUL-terminated, non-empty, and not absurdly long.
+		for (int i = 0; i < gsig::MONTAGE_NAME_MAX; ++i)
+		{
+			const unsigned char c = (unsigned char)name[i];
+			if (c == 0)
+			{
+				if (i == 0) break;
+				return name;
+			}
+			if (c < 0x20 || c == 0x7F) break;
+		}
+
+		// The offset is derived, so it can go stale on a game update - and when it
+		// does, the only symptom the user sees is that per-marker settings quietly
+		// stop being saved. Dump the head of the montage once so the next log says
+		// where the name actually moved to, instead of needing another RE session
+		// to find out that it moved at all.
+		{
+			static bool dumped = false;
+			if (!dumped)
+			{
+				dumped = true;
+				logger::write("info",
+					"settings: montage name not at +0x%X - dumping montage head so "
+					"the offset can be corrected", gsig::MONTAGE_NAME_OFF);
+
+				char line[128];
+				for (int row = 0; row < 0x100; row += 16)
+				{
+					int n = sprintf_s(line, "  +%03X ", row);
+					for (int i = 0; i < 16; ++i)
+						n += sprintf_s(line + n, sizeof(line) - n, "%02X ", montage[row + i]);
+					n += sprintf_s(line + n, sizeof(line) - n, " ");
+					for (int i = 0; i < 16; ++i)
+					{
+						const unsigned char c = montage[row + i];
+						n += sprintf_s(line + n, sizeof(line) - n, "%c",
+							(c >= 0x20 && c < 0x7F) ? c : '.');
+					}
+					logger::write("info", "%s", line);
+				}
+			}
+		}
+		return nullptr;
+	}
+
 	bool menuReady()
 	{
 		const bool common =
@@ -349,6 +427,26 @@ namespace game
 		addr_UpdateItemText = (pUit && *pUit) ? memory::scan(pUit).address : 0;
 		logger::write("info", "  UpdateItemTextValue    = %p", (void*)addr_UpdateItemText);
 
+		// The help-text choke point. Optional on both builds: without it our
+		// rows keep the blank help line they had before, and the per-row
+		// restrictions stay off (see menu.cpp - a greyed row whose reason we
+		// cannot state would be worse than an enabled one).
+		const char* pUmh = pick(gsig::PLAYBACK_UPDATEMENUHELPTEXT);
+		addr_UpdateMenuHelpText = (pUmh && *pUmh) ? memory::scan(pUmh).address : 0;
+		logger::write("info", "  UpdateMenuHelpText     = %p (rva 0x%llX)",
+			(void*)addr_UpdateMenuHelpText,
+			(uint64_t)(addr_UpdateMenuHelpText ? addr_UpdateMenuHelpText - memory::base() : 0));
+
+		// ms_project, Legacy: out of UpdateMenuHelpText, which loads it for the
+		// music/ambient help cases. Enhanced gets it below instead - it already
+		// resolves the same pointer under the g_EditClipController name, but not
+		// until the Enhanced derive block further down.
+		if (!isEnhanced() && addr_UpdateMenuHelpText)
+		{
+			addr_g_Project = derive(addr_UpdateMenuHelpText,
+				gsig::UMH_MSPROJECT_LEG, "g_Project");
+		}
+
 		// The PCM_* / MI_* values are INTERIOR OFFSETS, and they do not transfer
 		// between builds - Enhanced's bodies are a different shape entirely. So
 		// each build derives from its own set: Legacy from PCM_* / MI_*,
@@ -373,6 +471,11 @@ namespace game
 			// it), so there is no function to resolve - menu.cpp walks the clip
 			// array itself using these three.
 			addr_g_EditClipController = derive(b, gsig::PCM_E_CLIPCTRL,      "g_EditClipController");
+
+			// Same pointer, honest name. It is the open PROJECT; what menu.cpp
+			// treats as "the clip array" at +0x320 is really the montage, whose
+			// clip array happens to sit at its start.
+			addr_g_Project = addr_g_EditClipController;
 			addr_g_EditClipIndex      = derive(b, gsig::PCM_E_CLIPINDEX,     "g_EditClipIndex");
 			addr_g_EditMarkerIndex    = derive(b, gsig::PCM_E_EDITMARKERIDX, "g_EditMarkerIndex");
 
@@ -501,6 +604,114 @@ namespace game
 			addr_ReplayJumpTo = memory::scan(p).address;
 			logger::write("info", "  ReplayJumpTo         = %p (rva 0x%llX)", (void*)addr_ReplayJumpTo,
 				(uint64_t)(addr_ReplayJumpTo ? addr_ReplayJumpTo - memory::base() : 0));
+		}
+
+		// Optional: without it a clip recorded in first person keeps the
+		// recorded camera no matter what its markers ask for.
+		if (const char* p = pick(gsig::REPLAY_ISPLAYBACKFLAGSET); p && *p)
+		{
+			addr_IsPlaybackFlagSet = memory::scan(p).address;
+			logger::write("info", "  IsPlaybackFlagSet    = %p (rva 0x%llX)",
+				(void*)addr_IsPlaybackFlagSet,
+				(uint64_t)(addr_IsPlaybackFlagSet ? addr_IsPlaybackFlagSet - memory::base() : 0));
+		}
+
+		// Optional: without it recording keeps the stock 7-block budget.
+		if (const char* p = pick(gsig::REPLAY_SETUPREPLAYBUFFER); p && *p)
+		{
+			addr_SetupReplayBuffer = memory::scan(p).address;
+			logger::write("info", "  SetupReplayBuffer    = %p (rva 0x%llX)",
+				(void*)addr_SetupReplayBuffer,
+				(uint64_t)(addr_SetupReplayBuffer ? addr_SetupReplayBuffer - memory::base() : 0));
+
+			// The buffer info struct, via the allocated-count field its prologue
+			// loads. Instrumentation only - it is how we find out what the ring
+			// ACTUALLY is at runtime rather than what we asked for.
+			if (addr_SetupReplayBuffer)
+			{
+				const uintptr_t allocField = derive(addr_SetupReplayBuffer,
+					pickD(gsig::SRB_BLOCKSALLOCATED), "g_ReplayBlocksAllocated");
+				if (allocField)
+					addr_g_ReplayBufferInfo = allocField - gsig::BUFINFO_ALLOCATED_OFF;
+			}
+		}
+
+		// The block count the RECORDING path reads. Taken off that call site
+		// rather than hooked, because the call can happen before we are up.
+		if (const char* p = pick(gsig::REPLAY_RECORDBUFFER_SITE); p && *p)
+		{
+			const uintptr_t site = memory::scan(p).address;
+			if (site)
+			{
+				addr_g_ReplayBlocks = derive(site, pickD(gsig::RBS_NUMBLOCKS), "g_ReplayBlocks");
+
+				// Enhanced only - the clamp that actually bounds a recording.
+				if (isEnhanced())
+					addr_g_ReplayTotalBlocks =
+						derive(site, gsig::RBS_TOTALBLOCKS, "g_ReplayTotalBlocks");
+			}
+			else
+				logger::write("info", "  replay record site not found - block count unchanged");
+		}
+
+		// The two heap-size immediates, plus the allocator object we test to
+		// find out whether the heap has already been committed. Resolved as a
+		// PAIR - see signatures.h for why a half-resolve must be treated as
+		// none at all.
+		if (const char* p = pick(gsig::REPLAY_HEAP_ALLOC_SITE); p && *p)
+		{
+			const uintptr_t a = memory::scan(p, true).address;
+			const char* q = pick(gsig::REPLAY_HEAP_CTOR_SITE);
+			const uintptr_t c = (q && *q) ? memory::scan(q, true).address : 0;
+
+			// The allocator object. Enhanced leas it at the top of its own init
+			// block; Legacy leas it into rbp just after the reservation, i.e.
+			// inside the alloc site above.
+			if (isEnhanced())
+			{
+				if (const char* h = pick(gsig::REPLAY_HEAP_INIT_SITE); h && *h)
+				{
+					const uintptr_t site = memory::scan(h, true).address;
+					if (site)
+						addr_g_ReplayAllocator =
+							derive(site, gsig::RHI_ALLOCATOR_OBJ_ENH, "g_ReplayAllocatorObj");
+				}
+			}
+			else if (a)
+			{
+				addr_g_ReplayAllocator =
+					derive(a, gsig::RHI_ALLOCATOR_OBJ_LEG, "g_ReplayAllocatorObj");
+			}
+
+			if (a && c)
+			{
+				addr_ReplayHeapAllocImm = a + gsig::RHA_SIZE_IMM_OFF;
+				addr_ReplayHeapCtorImm  = c + (isEnhanced() ? gsig::RHC_SIZE_IMM_OFF_ENH
+				                                           : gsig::RHC_SIZE_IMM_OFF_LEG);
+				logger::write("info",
+					"  ReplayHeapSize       = %p / %p (rva 0x%llX / 0x%llX, currently %u MB)",
+					(void*)addr_ReplayHeapAllocImm, (void*)addr_ReplayHeapCtorImm,
+					(uint64_t)(addr_ReplayHeapAllocImm - memory::base()),
+					(uint64_t)(addr_ReplayHeapCtorImm - memory::base()),
+					*(unsigned*)addr_ReplayHeapAllocImm / (1024u * 1024u));
+			}
+			else if (replayHeapWidenedEarly)
+			{
+				// Expected, not a failure. The early path already patched the
+				// size immediate, and the patterns key on that immediate's stock
+				// value - so they can no longer match the very sites they came
+				// from. The addresses it handed over are already in place.
+				logger::write("info",
+					"  ReplayHeapSize       = %p / %p (patched at attach, currently %u MB)",
+					(void*)addr_ReplayHeapAllocImm, (void*)addr_ReplayHeapCtorImm,
+					*(unsigned*)addr_ReplayHeapAllocImm / (1024u * 1024u));
+			}
+			else
+			{
+				logger::write("info",
+					"  replay heap sites incomplete (alloc=%d ctor=%d) - heap left alone",
+					a != 0, c != 0);
+			}
 		}
 
 		if (const char* p = pick(gsig::REPLAYMGR_SETCURSORSPEED); p && *p)

@@ -11,6 +11,13 @@ Enhanced (`GTA5_Enhanced.exe`), singleplayer and FiveM, one build.
 - **Render pipeline** on the Export button — video or image sequence, arbitrary
   frame rate, accumulated motion blur, project audio, no watermark. Renders every
   clip in the project.
+- **Longer recordings** — the clip length limit is a memory budget, not a timer,
+  which is why a busy street gives you seconds where an empty road gives a
+  minute. Lifting it takes ~17 seconds of dense city to **1m 45s**. On by
+  default; costs ~600 MB of reserved address space.
+- **Free camera on first-person clips** — the editor normally greys out the whole
+  Camera submenu on anything recorded in first person, leaving the clip stuck
+  with the recorded view.
 - **Editor limits lifted** — camera distance, collision, profanity check,
   timeline spinner, zoom range.
 
@@ -84,6 +91,94 @@ and silently discards the rest.
 
 **Adjust Step** sets the increment for left/right, 0.001 to 1. Changes save
 automatically — global to the ini, per-marker to a side-car file.
+
+---
+
+## Per-marker settings
+
+A marker's curve, shake and per-axis values are stored beside the project rather
+than inside it, because the marker struct is serialised straight into the `.clip`
+file and has nowhere to put extra fields without breaking the format the game's
+own loader validates. Keeping them outside means a project still opens on a
+machine without this mod.
+
+They are scoped to the **project and clip** you set them in.
+`markers\<project>.txt` holds one project, with its clips as sections inside:
+
+```
+RockstarEditorPlus v6
+clip 0
+marker 7138 shake=1 intensity=1.35 freqMul=0.15
+marker 7968 shake=1 intensity=1.35
+clip 1
+marker 0 orient=2
+```
+
+Fields are named and only written when set, so the file stays readable and a
+lightly-edited marker is one short line. Plain text, safe to hand-edit if a
+project needs rescuing.
+
+> Scoping is by clip *index*, so reordering a project's clips carries the
+> settings with the slot rather than with the clip.
+
+---
+
+## First-person clips
+
+Record anything from the first-person view and the editor greys out the whole
+Camera submenu — the clip keeps the recorded view forever.
+
+`UnlockCameraRestrictions=1` (default) removes it, and those clips take a free
+camera like any other.
+
+There are two locks, not one. The menu greys the row, and separately the camera
+director ignores whatever the marker asks for and forces the recorded camera —
+so unlocking only the menu gives you a free camera that will not move, because
+there is no free camera. Both are lifted.
+
+The same pair of locks covers clips recorded during a cutscene or with camera
+movement disabled, and those are lifted too. In practice you are unlikely to have
+such a clip: recording stops while controls are disabled, which is the same
+condition that flags them.
+
+---
+
+## Recording length
+
+`ReplayBlocks` in `RockstarEditorPlus.ini`. The recording ring **is** the clip:
+it fills, the clip saves, and recording rolls straight into a new one — so
+length is ring size divided by how fast the scene fills it. That is why the
+number moves with traffic density rather than being a fixed duration.
+
+The game ships 30 blocks, and not by preference: its settings code force-clamps
+the count to 30 whenever the replay heap is under ~196 MB, and the heap is
+172 MB. The heap is widened first, so the clamp stops firing.
+
+Measured in dense city traffic:
+
+| | ring | clip |
+|---|---|---|
+| 30 *(the game's own)* | 120 MB | ~17 s |
+| 64 | 256 MB | ~44 s |
+| **128** *(default)* | 512 MB | **~1m 45s** |
+
+**It costs RAM.** Each block needs 4 MB plus a 384 KB thumbnail, so the default
+reserves about 604 MB for the session, and clips grow to match — a 128-block
+clip is roughly 230 MB on disk. That is the right trade for a tool whose whole
+job is capturing footage, but lower it if memory is tight. If you shoot long,
+check the editor's own disk allowance under Settings → Saving & Startup.
+
+Above 30 depends on the heap widening succeeding. If it cannot — the patterns
+did not resolve on your build, or the process cannot reserve that much address
+space — the value is clamped back to 30 and the log says which. Takes effect at
+the next recording, so restart before shooting.
+
+**Under FiveM this has to happen much earlier.** The pool is sized once at
+startup and can only be changed before that, and FiveM defers the mod's init to
+ScriptHookV — 20 to 90 seconds later, long after the pool is committed. So the
+widening runs at DLL attach instead, before anything else. Same result; the log
+reports it separately (`replay heap 172 -> 604 MB ... patched at attach`) so you
+can tell which path did the work.
 
 ---
 
@@ -245,7 +340,9 @@ Both files live in `RockstarEditorPlus\`, beside the `.asi`.
 | `DisableCameraCollision` | 1 | pass through geometry |
 | `BypassProfanityFilter` | 1 | naming/export works with Social Club offline |
 | `HideEditorSpinner` | 1 | no spinner while scrubbing |
-| `UncapZoom` | 0 | widen the 0.45x–4.50x range |
+| `UncapZoom` | 1 | widen the 0.45x–4.50x range to the engine's own 1–130° |
+| `ReplayBlocks` | 128 | recording length, in 4 MB blocks. 3–128 |
+| `UnlockCameraRestrictions` | 1 | free camera on first-person clips |
 | `ShakeDebugLog` `SplineDebugLog` `SplineTraceLog` | 0 | diagnostics |
 
 ### `Render.ini`
@@ -280,7 +377,7 @@ RockstarEditorPlus\
     RockstarEditorPlus.log
     ffmpeg.exe                      bundled
     presets\                        codec presets
-    markers\                        per-marker settings
+    markers\                        per-marker settings, one file per project
     Captures\render_0001\           frames, or video.mp4
 ```
 
@@ -296,7 +393,12 @@ puts everything in `plugins\RockstarEditorPlus\`. Set `RenderOutputFolder` to an
 absolute path to write renders off the game drive.
 
 Per-marker settings are stored outside the `.clip` file, so projects stay
-loadable without this mod installed.
+loadable without this mod installed. See [Per-marker settings](#per-marker-settings)
+for how they are scoped.
+
+An ini written by an older build will not contain keys added since. Those fall
+back to their defaults, so nothing breaks — but a key has to be present before
+you can change it. Delete the ini to have a current one written.
 
 ---
 

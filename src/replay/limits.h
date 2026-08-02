@@ -13,6 +13,11 @@ namespace limits
 	// ini has it disabled or the address did not resolve.
 	void install();
 
+	// Per-frame. Installs the hooks that cannot be placed at startup because they
+	// hang off an object the editor only creates once a clip is open. Cheap: a
+	// bool after the first success.
+	void tick();
+
 	// Per-frame. Keeps the leash lifted by rewriting the director's metadata,
 	// which is the only thing that works where the distance getter is inlined
 	// (Enhanced). Restores the original the moment the option is turned off.

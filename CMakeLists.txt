@@ -140,10 +140,41 @@ UnlimitedCameraDistance=1  ; lift the 30m leash off the player
 MaxCameraDistance=20000    ; the world streams near the player - expect LOD pop
 DisableCameraCollision=1   ; camera passes through geometry
 BypassProfanityFilter=1    ; naming/export still works with Social Club offline
+UnlockCameraRestrictions=1 ; free camera on first-person / cutscene clips
 HideEditorSpinner=1        ; no spinner ring while scrubbing
-UncapZoom=0                ; widen the stock 0.45x..4.50x range
+UncapZoom=1                ; widen the stock 0.45x..4.50x range
 ZoomMinFov=1               ; 1..130 is the engine's own clamp
 ZoomMaxFov=130             ; readout is 45/fov: 1 = 45x in, 130 = 0.35x out
+
+; --- Recording length --------------------------------------------------------
+; HOW LONG A SINGLE CLIP CAN BE, in 4 MB blocks.
+;
+; The recording ring IS the clip: it fills, the clip is saved, and recording
+; rolls straight into a new one. So length = ring size / how fast the scene
+; fills it - which is exactly why a street full of traffic gives you seconds
+; where an empty road gives you a minute.
+;
+; The game ships 30 blocks (120 MB), and that is not its own preference: its
+; settings code force-clamps the count to 30 whenever the replay heap is under
+; ~196 MB, and the heap is 172 MB. We widen the heap first, so the clamp stops
+; firing and the count can go up.
+;
+; Measured in dense city traffic:
+;    30 blocks / 120 MB   ~17 seconds   (stock)
+;    64 blocks / 256 MB   ~44 seconds
+;   128 blocks / 512 MB   ~1m 45s
+;
+; COSTS, because 128 is the default and it is not free. The heap is sized for
+; the blocks plus a 384 KB thumbnail each, so this reserves about 604 MB of RAM
+; for the session, and clips grow to match - a 128-block clip is roughly 230 MB
+; on disk. Lower it if memory is tight; check the editor's own disk allowance
+; under Settings -> Saving & Startup if you shoot long clips.
+;
+; 3..128. Above 30 needs the heap widening to succeed - if it cannot (the sites
+; did not resolve on your build, or this machine cannot reserve the address
+; space) the value is clamped back to 30 and the log says which. Takes effect at
+; the next recording setup, so restart before recording.
+ReplayBlocks=128
 
 ; --- Menu state (written for you) -------------------------------------------
 MenuGroup=0

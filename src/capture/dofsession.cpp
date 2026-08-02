@@ -521,7 +521,16 @@ namespace dofsession
 		{
 			s_startSeen = startSeq;
 			s_moveSeen  = s_moveSeq.load();   // ignore anything queued before we began
-			beginOnMainThread();
+
+			// Only if the session is STILL open.
+			//
+			// The end sequence is consumed above and RETURNS, so a start and an end
+			// arriving between two pumps leaves the start to be applied a frame
+			// later - against a session the add-on has already closed. That took
+			// the HUD and the cursor down, paused playback and forced collision
+			// off, with s_active already false and nothing to undo any of it until
+			// the 120s idle timeout expired.
+			if (s_active.load()) beginOnMainThread();
 		}
 
 		if (!s_running) return;

@@ -564,6 +564,549 @@ namespace gsig
 	};
 
 	// -------------------------------------------------------------------------
+	// CVideoEditorPlayback::UpdateMenuHelpText(s32 menuIndex)
+	//   leg 0x1CB6EC   enh 0x671CA0
+	//
+	// THE help-text choke point. Every route that changes which row has focus
+	// ends here - the tail of each Populate*, the focus-change block in the input
+	// dispatcher, and the mouse hover path - so hooking it is what lets our rows
+	// carry a real help line instead of the blank one they get today.
+	//
+	// What it does, read off both decompiles:
+	//
+	//   opt        = options.data[idx].m_option           (+0)
+	//   restrict   = options.data[idx].m_editRestrictions (+4)
+	//   if (restrict != 0)  key = s_restrictionStrings[ restrict <= 7 ? restrict : "" ]
+	//   else                key = <per-option special cases>
+	//                             ?: sc_EditMarkerMenuHelpText[ opt ]
+	//   if (key) UPDATE_COLUMN_HELP_TEXT( TheText.Get(key) )
+	//
+	// Two things that pin our own design and were previously only inferred:
+	//
+	//   * `sc_EditMarkerMenuHelpText[opt]` is indexed with NO UPPER BOUND on
+	//     EITHER build (leg `mov rdx,[base+rax*8+0x19edb10]` after a bare
+	//     movsxd; enh `lea rcx,[helpArray]` / `mov rdx,[rcx+rax*8]`). So an
+	//     option id >= MARKER_MENU_OPTION_MAX reads past the array and hands a
+	//     garbage pointer to TheText::Get. OURS_OPTION_ID staying inside the
+	//     enum is a hard requirement, not tidiness - see the note there.
+	//   * the RESTRICTION path is bounded, at 7, on both builds. That is
+	//     EDIT_RESTRICTION_MAX - 1, which is what makes writing a restriction
+	//     into our own option entries safe.
+	//
+	// The final call sequence is the ordinary BeginMethod / AddParamString /
+	// EndMethod trio we already resolve, and it takes a LOCALIZED STRING rather
+	// than a text key - so our literals go straight in with nothing added to the
+	// game's string table.
+	//
+	// Both patterns verified unique in their own image. Legacy's tail carries
+	// `mov ecx, MARKER_MENU_OPTION_MAX` (B9 28 00 00 00), the null-option
+	// fallback, which is the fingerprint; Enhanced inlines TryGetMenuOption
+	// entirely and is pinned by the count/focus-index pair plus the `setl dl`.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig PLAYBACK_UPDATEMENUHELPTEXT = {
+		"41 57 41 56 41 54 56 57 55 53 48 83 EC 40 0F B7 05 ? ? ? ? "
+		"39 05 ? ? ? ? 0F 9C C2 85 C0 0F 84 ? ? ? ? 84 D2 0F 84 ? ? ? ? 31 DB 39 C8",
+		"40 53 48 83 EC 30 0F B7 05 ? ? ? ? 85 C0 0F 8E ? ? ? ? 39 05 ? ? ? ? "
+		"0F 8D ? ? ? ? E8 ? ? ? ? 48 85 C0 74 04 8B 08 EB 05 B9 28 00 00 00"
+	};
+
+	// -------------------------------------------------------------------------
+	// The active PROJECT, and how to get its name.
+	//
+	// Per-marker settings live in a side-car keyed by marker time, and until now
+	// there was one file for everything - so a marker at 2000ms in one project
+	// picked up whatever a marker at 2000ms in another had been given. The fix
+	// needs a project identity, and this is it.
+	//
+	//   project  = *(void**)g_Project
+	//   montage  = *(void**)(project + 0x320)
+	//   name     = (const char*)(montage + 0x70)
+	//
+	// +0x320 is read straight out of the disassembly. The routine that opens a
+	// playback tests exactly that slot for null to decide whether a project is
+	// loaded, and the pointer sitting there is the same one menu.cpp already
+	// walks to reach the clip array.
+	//
+	// The head of the montage is a run of atArrays - an 8-byte data pointer, a
+	// u16 count, a u16 capacity, 4 bytes of padding, 16 bytes each. Two of them
+	// are pinned by code we can read:
+	//
+	//   +0x00  data +0x00, count +0x08   the CLIPS - menu.cpp walks this today
+	//   +0x20  data +0x20, count +0x28   read as a u16 count while validating
+	//                                    music entries, 16-byte elements
+	//
+	// That fixes the stride. The name is at +0x70, and unlike the two above it
+	// was found by TRYING it: game::projectName() reads the offset and checks
+	// what comes back is printable and NUL-terminated, and the log then showed
+	// the real project name. Between the arrays and the name is a stretch of
+	// fixed-size scalars with no padding slack, which is why nothing else in
+	// there is worth naming - it is not read.
+	//
+	// The offset stays DERIVED regardless, so the validation is not a formality:
+	// a wrong guess costs a fallback rather than garbage in a filename. The
+	// earlier 0x58 here was exactly that - it assumed an 8-byte array stride and
+	// landed on a plausible-looking number, and the only reason it did no damage
+	// is that the check refused it. If a game update moves the field, the
+	// failure path dumps the head of the montage to the log so the new offset
+	// can be read off directly.
+	//
+	// A new project is named the moment it is created, not when it is saved, so
+	// this is never empty for an unsaved project.
+	// -------------------------------------------------------------------------
+	inline constexpr int PROJECT_MONTAGE_OFF = 0x320;
+	inline constexpr int MONTAGE_NAME_OFF    = 0x70;
+	inline constexpr int MONTAGE_NAME_MAX    = 256;  // sanity bound when reading
+
+	// Legacy takes it out of UpdateMenuHelpText, which loads it for the
+	// music/ambient help cases. Enhanced already resolves the same pointer as
+	// g_EditClipController - see the note on that in game.h.
+	inline constexpr unsigned char OP_MOV_RAX_MEM[] = { 0x48, 0x8B, 0x05 };
+	inline constexpr Derive UMH_MSPROJECT_LEG = { 0x12A, 0x12D, OP_MOV_RAX_MEM, 3, 0 };
+
+	// -------------------------------------------------------------------------
+	// IReplayMarkerStorage::eEditRestrictionReason
+	//
+	// The middle dword of a MenuOption. 0 means the row is live; ANY other value
+	// makes the game disable it, and it does so through three separate paths we
+	// therefore get for free by writing one field:
+	//
+	//   UpdateEditMenuState()             greys the row (SET_ITEMS_GREYED_OUT),
+	//                                     and runs at the END of the populate,
+	//                                     i.e. after our injection
+	//   SetCurrentItemIntoCorrectState()  draws it without left/right arrows
+	//   UpdateFocusedInputEditMenu()      plays ERROR on accept, ignores toggles
+	//
+	// Confirmed in the retail decompile of PopulateCameraMenu, which writes
+	// `IS_ENDPOINT` here for the Camera Type row on the last marker:
+	//     *puVar7 = 0x11;  puVar7[1] = -(uint)bVar2 & 6;  puVar7[2] = -1;
+	// -------------------------------------------------------------------------
+	// The marker-storage virtual at vtable offset 0x160 (slot 44). Takes a
+	// control id and returns one of the reasons above, 0 meaning "editable" -
+	// and it is what locks a clip recorded in first person out of the free
+	// camera.
+	//
+	// Found by disassembly, not guessed. The marker-menu populate carries five
+	// `call qword ptr [rax+0x160]` sites on BOTH builds, and the one feeding the
+	// camera row reads:
+	//
+	//     mov  rcx, [rsp+0x58]        ; the marker storage
+	//     mov  rax, [rcx]             ; its vtable
+	//     mov  edx, 9                 ; the control id
+	//     call qword ptr [rax+0x160]
+	//     test eax, eax               ; non-zero -> row disabled
+	//
+	// Walking the same populate for the other four call sites gives the rest of
+	// the control ids; 8 and 9 are the two camera rows, 0 is the speed row.
+	//
+	// For the camera rows the answer is FIRST_PERSON, CUTSCENE or CAMERA_BLOCKED
+	// depending on flags baked into the recording, so it is a property of the
+	// clip and cannot be edited after the fact - the only way in is to stop the
+	// answer being consulted.
+	//
+	// The restriction is purely a UI gate: no camera code reads it, so once the
+	// menu lets a marker be set to a free camera the camera runs it with no
+	// further objection. That was worth establishing before hooking anything -
+	// a second gate in the camera itself would have made this pointless.
+	inline constexpr int MARKERSTORAGE_VT_ISEDITABLE = 0x160;
+
+	// Control ids, as passed in edx at the call sites above.
+	inline constexpr int MARKER_CONTROL_SPEED       = 0;
+	inline constexpr int MARKER_CONTROL_CAMERA      = 8;
+	inline constexpr int MARKER_CONTROL_CAMERA_TYPE = 9;
+	inline constexpr int MARKER_CONTROL_MAX         = 10;
+
+	// -------------------------------------------------------------------------
+	// The CURRENT CLIP'S recorded flags, and the second lock on the free camera.
+	//
+	// Unlocking the menu is not enough. Before the camera director looks at what
+	// the marker asks for, it tests ONE bit of these flags and, if it is set,
+	// returns the recorded camera regardless - so the marker says free camera and
+	// the director hands back the recorded one. The symptom is a free camera that
+	// will not move, because there is no free camera.
+	//
+	// The trap is that recording in first person sets TWO bits, not one. The
+	// condition behind the camera-disabled bit includes "the dominant rendered
+	// camera is a first-person camera", which is the same thing that sets the
+	// first-person bit - so a first-person clip is ALWAYS also flagged as
+	// camera-disabled, and clearing the first restriction alone leaves the
+	// stronger one in place.
+	//
+	// Bit values read straight out of the restriction virtual, which tests all
+	// three in one place:
+	//
+	//     mov  ecx, [rip+clipFlags]
+	//     mov  eax, 2   / test cl, 4    -> CUTSCENE
+	//     mov  eax, 1   / test cl, 8    -> FIRST_PERSON
+	//     and  ecx, 1   / neg / and 3   -> CAMERA_BLOCKED
+	//
+	// The two checks read DIFFERENT STORAGE, which is the whole trap here. The
+	// restriction virtual reads a single aggregate global describing the clip.
+	// The director does NOT - it asks whether the flag is set on the frame packet
+	// being played right now, and every recorded frame carries its own copy. So
+	// clearing the aggregate satisfies the menu and changes nothing about the
+	// camera; the two have to be addressed separately.
+	// -------------------------------------------------------------------------
+	inline constexpr unsigned CLIPFLAG_DISABLE_CAMERA_MOVEMENT = 1u << 0;
+	inline constexpr unsigned CLIPFLAG_RECORDED_CUTSCENE       = 1u << 2;
+	inline constexpr unsigned CLIPFLAG_RECORDED_FIRST_PERSON   = 1u << 3;
+
+	// -------------------------------------------------------------------------
+	// CReplayMgrInternal::IsPlaybackFlagSet(u32 flag) - the per-frame reader.
+	//
+	//     packet = *(void**)g_CurrentFramePacket
+	//     return packet && (*(u32*)(packet + 0x18) & flag) != 0;
+	//
+	// This is the SECOND lock on the free camera, and the one that actually
+	// stops it moving. The camera director calls it with the camera-disabled bit
+	// and, when it comes back true, returns the recorded camera without ever
+	// looking at what the marker asked for:
+	//
+	//     if (IsPlaybackFlagSet(1)) -> recorded camera
+	//     else switch (marker[+0xA1]) { ... free camera ... }
+	//
+	// So the marker says free camera, the director hands back the recorded one,
+	// and the symptom is a free camera that will not move because there is no
+	// free camera. Confirmed by decompiling the caller on both builds; both are
+	// the same shape and both call a real, un-inlined function.
+	//
+	// Answering false for that ONE bit is the unlock. The same function serves
+	// every other playback flag - in-vehicle, aircraft shadows, first person for
+	// VFX - so it must not be neutered wholesale, and every caller passes a
+	// single bit rather than a mask. Bit 0 has exactly one caller: the camera
+	// selection above.
+	//
+	// The bodies are tiny but the `test [reg+0x18], ecx` + `setnz al` pair is
+	// distinctive; both patterns verified unique in their own image.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig REPLAY_ISPLAYBACKFLAGSET = {
+		"48 8B 05 ? ? ? ? 48 85 C0 74 07 85 48 18 0F 95 C0 C3 31 C0 C3",
+		"48 8B 15 ? ? ? ? 33 C0 48 85 D2 74 06 85 4A 18 0F 95 C0 C3"
+	};
+
+	inline constexpr unsigned EDIT_RESTRICTION_NONE           = 0;
+	inline constexpr unsigned EDIT_RESTRICTION_FIRST_PERSON   = 1;
+	inline constexpr unsigned EDIT_RESTRICTION_CUTSCENE       = 2;
+	inline constexpr unsigned EDIT_RESTRICTION_CAMERA_BLOCKED = 3;
+	inline constexpr unsigned EDIT_RESTRICTION_DOF_DISABLED   = 4;
+	inline constexpr unsigned EDIT_RESTRICTION_IS_ANCHOR      = 5;
+	inline constexpr unsigned EDIT_RESTRICTION_IS_ENDPOINT    = 6;
+	inline constexpr unsigned EDIT_RESTRICTION_NEEDS_BLEND    = 7;
+	inline constexpr unsigned EDIT_RESTRICTION_MAX            = 8;
+
+	// -------------------------------------------------------------------------
+	// CReplayMgrInternal::SetupReplayBuffer(u16 normalBlocks, u16 tempBlocks)
+	//   leg 0x144938   enh 0x7B7380
+	//
+	// HOW LONG YOU CAN RECORD. Not a duration limit - a memory one. The recorder
+	// writes into a ring of fixed 4 MB blocks, so a street full of traffic fills
+	// them in seconds where an empty desert lasts a minute. Stock is 7 blocks,
+	// i.e. 28 MB.
+	//
+	// This function is the entire patch point, because it does its own memory
+	// management:
+	//
+	//   total = normal + temp;
+	//   if (total > blocksAllocated) {
+	//       FreeMemory();
+	//       if (!AllocateMemory(total, 0x400000)) { FreeMemory(); return false; }
+	//   }
+	//   if (blocksAllocated) { bufferInfo.Reset(); SetBlockCount(normal, temp); ... }
+	//
+	// So raising the first argument is all there is to it - it frees, reallocates
+	// and redoes its own block bookkeeping. It only reallocates when the request
+	// GROWS, so one raised call sizes the buffer once and it never churns after.
+	//
+	// TWO THINGS THAT MATTER:
+	//
+	//   * ONLY RAISE IT ON THE RECORDING PATH. Clip loading calls this as
+	//     (header.PhysicalBlockCount, 0) and teardown as (0, 0). A non-zero temp
+	//     count is what marks the recording setup. Inflating a load would tell
+	//     the buffer it holds more blocks than the clip ever wrote, and playback
+	//     would walk blocks nothing filled.
+	//   * THE COUNT IS BOUNDED BY THE REPLAY HEAP, not by this function. Blocks
+	//     are allocated one at a time out of a fixed pool reserved at startup,
+	//     and going past what that pool holds does not fail cleanly - see
+	//     REPLAY_HEAP_ALLOC_SITE below, which is what has to move first.
+	//
+	// Both patterns verified unique. Legacy loads the allocated-block count
+	// first and widens both u16 args; Clang moves them into esi/edi and uses a
+	// `lea ebx,[rsi+rdi]` for the total - different shape, same function, and
+	// each pattern's rip-relative operand resolves to that build's own
+	// blocks-allocated global (leg 0xD1AFF2, enh 0x3E31762), which is the
+	// cross-check that they are the same function on both.
+	// -------------------------------------------------------------------------
+	// -------------------------------------------------------------------------
+	// CReplayBufferInfo, off the movzx in SetupReplayBuffer's prologue.
+	//
+	// The prologue loads m_numberOfBlocksAllocated, which sits at +0x2A, so the
+	// struct base is that address minus 0x2A. Layout read off SetBlockCount,
+	// which writes two PAIRS of counters:
+	//
+	//   +0x08 m_numBlocks            +0x0A m_numTempBlocks          configured
+	//   +0x0C m_currentNumBlocks     +0x0E m_currentNumTempBlocks   LIVE
+	//   +0x10 m_pBlocks              +0x2A m_numberOfBlocksAllocated
+	//
+	// The live pair is the one that matters and the reason this is instrumented
+	// at all. The routine that hands a block to the temp buffer decrements the
+	// live normal count and increments the live temp one, so blocks move OUT of
+	// the recording ring while a save is in flight. The ring you configure is
+	// therefore not necessarily the ring you record into, and the only way to
+	// know which you got is to read it back.
+	// -------------------------------------------------------------------------
+	inline constexpr unsigned char OP_MOVZX_EAX_M16[] = { 0x0F, 0xB7, 0x05 };
+
+	inline constexpr DerivePair SRB_BLOCKSALLOCATED = {
+		{ 0x0E, 0x11, OP_MOVZX_EAX_M16, 3, 0 },   // enh
+		{ 0x0F, 0x12, OP_MOVZX_EAX_M16, 3, 0 },   // leg
+	};
+	inline constexpr int BUFINFO_ALLOCATED_OFF   = 0x2A;  // to get back to the base
+	inline constexpr int BUFINFO_NUMBLOCKS       = 0x08;
+	inline constexpr int BUFINFO_NUMTEMP         = 0x0A;
+	inline constexpr int BUFINFO_CURRENTBLOCKS   = 0x0C;
+	inline constexpr int BUFINFO_CURRENTTEMP     = 0x0E;
+
+	inline constexpr Sig REPLAY_SETUPREPLAYBUFFER = {
+		"56 57 53 48 83 EC 20 89 D6 89 CF 8D 1C 3E 0F B7 05 ? ? ? ? "
+		"66 39 C3 76 20 E8",
+		"48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 0F B7 05 ? ? ? ? "
+		"0F B7 FA 0F B7 F1 8D 1C 37 66 3B D8"
+	};
+
+	// -------------------------------------------------------------------------
+	// The RECORDING call site, and CReplayMgrInternal::NumberOfReplayBlocks.
+	//
+	// Hooking SetupReplayBuffer alone was not enough, and the reason is worth
+	// recording: all four of its call sites were decoded, and the two recording
+	// ones read the block count out of a GLOBAL rather than computing it -
+	//
+	//   enh  mov byte [rip+d],1
+	//        movzx edx,word [NumberOfTempReplayBlocks]
+	//        movzx ecx,word [NumberOfReplayBlocks]      <- this one
+	//        call  SetupReplayBuffer
+	//
+	//   leg  movzx ecx,word [NumberOfReplayBlocks]      <- this one
+	//        mov   edx,6                                 (the temp-block count)
+	//        call  SetupReplayBuffer
+	//
+	// so writing the global covers every path that reads it, whenever it runs,
+	// with no dependence on our hook being installed before the call. The other
+	// two sites are the teardown (0,0) and the clip load (count,0) - both pass a
+	// zero temp count, which is what the hook's discriminator keys on.
+	//
+	// Patterns verified unique in each image.
+	// -------------------------------------------------------------------------
+	inline constexpr unsigned char OP_MOVZX_ECX_M16[] = { 0x0F, 0xB7, 0x0D }; // movzx ecx,word[rip+d]
+	inline constexpr unsigned char OP_MOV_M16_IMM16[] = { 0x66, 0xC7, 0x05 }; // mov word[rip+d],imm16
+
+	// -------------------------------------------------------------------------
+	// The Enhanced site opens with the CLAMP, and that is the point of starting
+	// it nine bytes earlier than the call:
+	//
+	//   66 C7 05 d32 2A 00   mov  word [TotalNumberOfReplayBlocks], 42
+	//   C6 05 d32 01         mov  byte [..], 1
+	//   0F B7 15 d32         movzx edx, word [NumberOfTempReplayBlocks]
+	//   0F B7 0D d32         movzx ecx, word [NumberOfReplayBlocks]
+	//   E8 rel32             call SetupReplayBuffer
+	//
+	// The enable path caps TotalNumberOfReplayBlocks at 42 immediately before
+	// setting the buffer up, and THAT is what bounds a
+	// recording - not the count passed to SetupReplayBuffer. Allocating 70
+	// blocks and leaving this at 42 gave a buffer two thirds of which was never
+	// written: 24 seconds instead of the expected 35.
+	//
+	// It does not need patching. The clamp runs before the call, we hook the
+	// call, so writing the global from inside the hook lands after it - and
+	// nothing has read it yet. One less immediate to patch, and it follows the
+	// ini live like everything else.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig REPLAY_RECORDBUFFER_SITE = {
+		"66 C7 05 ? ? ? ? 2A 00 C6 05 ? ? ? ? 01 0F B7 15 ? ? ? ? 0F B7 0D ? ? ? ? E8",
+		"0F B7 0D ? ? ? ? BA 06 00 00 00 E8"
+	};
+
+	// u16 CReplayMgrInternal::NumberOfReplayBlocks, off the site above.
+	inline constexpr DerivePair RBS_NUMBLOCKS = {
+		{ 0x17, 0x1A, OP_MOVZX_ECX_M16, 3, 0 },   // enh - the second movzx
+		{ 0x00, 0x03, OP_MOVZX_ECX_M16, 3, 0 },   // leg - the site opens with it
+	};
+
+	// u16 CReplayMgrInternal::TotalNumberOfReplayBlocks - the one that actually
+	// bounds a recording. Enhanced only; Legacy's clamp has not been located,
+	// and without it that build simply cannot exceed the stock budget.
+	// extra = 2 for the trailing imm16, which the plain disp+4 would miss.
+	inline constexpr Derive RBS_TOTALBLOCKS = { 0x00, 0x03, OP_MOV_M16_IMM16, 3, 2 };
+
+	// The block-count range.
+	//
+	// MIN and the 36 the engine clamps its own setter to are both visible as
+	// immediates in that setter's decompile. HARD_MAX is OURS - anything above
+	// the game's own count is only reachable once the replay heap below has been
+	// widened, and limits.cpp clamps back down if that could not be done.
+	//
+	// STOCK (7) is what the count global holds before the settings code runs.
+	// Do NOT treat it as the live value: both builds settle on 30, read out of
+	// the running game, because the settings apply force-clamps to 30 whenever
+	// the replay heap measures under ~196 MB - and stock is 172 MB.
+	inline constexpr int REPLAY_BLOCKS_MIN      = 3;
+	inline constexpr int REPLAY_BLOCKS_STOCK    = 7;
+	inline constexpr int REPLAY_BLOCK_BYTES     = 4 * 1024 * 1024;
+
+	// EVERY BLOCK COSTS MORE THAN A BLOCK.
+	//
+	// The routine that sizes the block array ends by allocating a second buffer
+	// per block - (blockCount + 1) of them - out of the same replay heap:
+	//
+	//     *(u64*)(p - 4) = 0x10000000200;              // 512 wide, 256 high
+	//     alloc( (256 * 512) * 3, 16, 0 );             // 393216 = 384 KB, RGB
+	//
+	// A thumbnail per block. Miss it and the heap arithmetic is out by 27 MB at
+	// 70 blocks, which is exactly how the first widening attempt still crashed.
+	//
+	// So the real cost is 4 MB + 384 KB per block, plus one spare thumbnail.
+	inline constexpr int REPLAY_BLOCK_THUMB_BYTES = 256 * 512 * 3;   // 384 KB
+	inline constexpr int REPLAY_BLOCK_TOTAL_BYTES =
+		REPLAY_BLOCK_BYTES + REPLAY_BLOCK_THUMB_BYTES;               // ~4.375 MB
+
+	// What the STOCK 172 MB heap can really hold.
+	//
+	// Not 36. The heap is sized as (42 + 1) * 4 MB, which does not count the
+	// thumbnails - so the engine's own stated maximum does not fit its own heap:
+	//   42 total -> 42*4.375 MB + 384 KB = 184 MB, against a 172 MB pool.
+	// The 30 + 6 = 36 total both builds settle on comes to 158 MB and fits with
+	// 14 MB spare, which is presumably why 30 is the number.
+	//
+	// So without widening the heap, 30 is the ceiling - and there is no reason to
+	// squeeze past it, because anything higher can simply widen instead.
+	inline constexpr int REPLAY_BLOCKS_SAFE_MAX = 30;
+
+	// -------------------------------------------------------------------------
+	// The replay HEAP - the thing that actually bounds the block count.
+	//   enh site 0x1247, inside the memory-manager init at rva 0x1020
+	//
+	// The whole limit is one allocation, made once, at the top of the process:
+	//
+	//   heap = reserve(0xAC00000);                 // 172 MB
+	//   allocator.init(heap, 0xAC00000, 8, 0);     // heap type 8, quit-on-fail OFF
+	//   g_pReplayAllocator = &allocator;
+	//
+	// 0xAC00000 is 172 MB, and the engine's own maximum of 42 blocks times the
+	// 4 MB block size is 168 MB. The heap is (42 + 1) * 4 MB - the block budget
+	// plus exactly one block of slack for the allocator's own headers.
+	//
+	// So 36 was never a policy choice or an array bound. It is the largest block
+	// count that FITS, and asking for 70 blocks wanted 280 MB out of a 172 MB
+	// pool. Quit-on-fail is off, so a short pool returns a null rather than
+	// aborting, and the block setup has no surviving check on it - the null
+	// reaches a dereference, which is the crash.
+	//
+	// Raising it means widening this allocation, which is TWO immediates in one
+	// function: the reservation size and the allocator's own size. The
+	// open question is not how, it is WHEN - this runs at rva 0x1020, and if it
+	// has already happened by the time we install then patching the immediates
+	// changes nothing. addr_g_ReplayAllocator exists to answer exactly that: it
+	// is null until the line above runs.
+	//
+	// Legacy is not patterned yet - settle the timing on Enhanced first, since a
+	// second hunt for a site we cannot use would be wasted.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig REPLAY_HEAP_INIT_SITE = {
+		"48 8D 3D ? ? ? ? 48 89 F9 31 D2 E8 ? ? ? ? 8B 05 ? ? ? ? 8B 0D ? ? ? ? "
+		"65 48 8B 14 25 58 00 00 00 48 8B 0C CA 3B 81 34 06 00 00 0F 8F ? ? ? ? 48 89 3D",
+		""
+	};
+
+
+	// -------------------------------------------------------------------------
+	// The two places 0xAC00000 appears, and both must move together.
+	//
+	//   rva 0x1213   B9 00 00 C0 0A       mov ecx,0xAC00000    -> reserve(size)
+	//   rva 0x1563   41 B8 00 00 C0 0A    mov r8d,0xAC00000    -> allocator.init(heap,size,..)
+	//
+	// One is how much memory is RESERVED, the other is how much the allocator
+	// believes it owns. Patching only the second would hand it a window past the
+	// end of the reservation - which is worse than the limit we are lifting, and
+	// would not fail until something allocated into that tail. So it is both or
+	// neither, and limits.cpp treats a half-resolve as a refusal.
+	//
+	// The stock size is part of each pattern deliberately. If a future build
+	// changes the heap, these stop matching and we leave it alone, which is the
+	// correct outcome - far better than writing a size derived from assumptions
+	// that no longer hold.
+	// -------------------------------------------------------------------------
+	// Same 0xAC00000 on BOTH builds - the heap is 172 MB either way. Only the
+	// codegen around it differs: Clang zeroes edx with `31 D2`, MSVC with
+	// `33 D2`, and MSVC keeps the allocator object in rbp across the call.
+	inline constexpr Sig REPLAY_HEAP_ALLOC_SITE = {
+		"B9 00 00 C0 0A 31 D2 E8 ? ? ? ? 48 89 C7",
+		"B9 00 00 C0 0A E8 ? ? ? ? 8B 0D ? ? ? ? 48 8D 2D ? ? ? ?"
+	};
+	inline constexpr int RHA_SIZE_IMM_OFF = 1;    // imm32 follows the B9, both builds
+
+	inline constexpr Sig REPLAY_HEAP_CTOR_SITE = {
+		"C6 44 24 20 00 48 8D 0D ? ? ? ? 41 B8 00 00 C0 0A 48 89 FA 41 B9",
+		"83 C9 40 41 B9 08 00 00 00 41 B8 00 00 C0 0A"
+	};
+	// The imm32 sits at a different depth in each - Clang loads the object
+	// pointer before the size, MSVC loads the heap type before it.
+	inline constexpr int RHC_SIZE_IMM_OFF_ENH = 14;
+	inline constexpr int RHC_SIZE_IMM_OFF_LEG = 11;
+
+	// The allocator OBJECT (not the pointer to it).
+	//
+	// Checked instead of m_pReplayAllocator because it is reachable on both
+	// builds from a site we already have: Clang leas it into rdi at the top of
+	// the init block, MSVC into rbp just after the reservation. It is a static,
+	// so its vtable slot is zero until the constructor runs - which is exactly
+	// the "has the heap been committed yet" question, and the only thing that
+	// decides whether widening it is still possible.
+	inline constexpr unsigned char OP_LEA_RDI[] = { 0x48, 0x8D, 0x3D };
+	inline constexpr unsigned char OP_LEA_RBP[] = { 0x48, 0x8D, 0x2D };
+
+	inline constexpr Derive RHI_ALLOCATOR_OBJ_ENH = { 0x00, 0x03, OP_LEA_RDI, 3, 0 };  // off HEAP_INIT_SITE
+	inline constexpr Derive RHI_ALLOCATOR_OBJ_LEG = { 0x10, 0x13, OP_LEA_RBP, 3, 0 };  // off HEAP_ALLOC_SITE
+
+	inline constexpr unsigned REPLAY_HEAP_STOCK_BYTES = 0x0AC00000u;  // 172 MB
+
+	// Above the engine's own maximum this is ours, and only reachable when the
+	// heap is widened first. 128 blocks is 512 MB of blocks plus headroom.
+	inline constexpr int REPLAY_BLOCKS_HARD_MAX = 128;
+
+	// The temp-block count, 6. Passed alongside the normal count at every
+	// recording setup, so the heap has to cover both.
+	inline constexpr int REPLAY_TEMP_BLOCKS = 6;
+
+	// What the pool has to be to hold `blocks` recording blocks.
+	//
+	// A function rather than a number because TWO paths need it and they must
+	// agree exactly: the normal install, and the early FiveM one that has to
+	// patch the size before ScriptHookV hands us a thread. If those two ever
+	// computed different sizes the game would reserve one amount and then record
+	// against another, which is a crash rather than a wrong number.
+	//
+	// Sized from what a block ACTUALLY costs - 4 MB plus a 384 KB thumbnail,
+	// with one spare thumbnail on top, then 16 MB of slack for allocator
+	// bookkeeping. The engine's own (n+1)*4MB ignores thumbnails entirely, which
+	// is why its stated 42-block maximum does not fit its own heap. Rounded to a
+	// 4 MB boundary to keep the pool block-aligned.
+	inline constexpr unsigned replayHeapBytesFor(int blocks)
+	{
+		const unsigned total = (unsigned)(blocks + REPLAY_TEMP_BLOCKS);
+		const unsigned bytes = total * (unsigned)REPLAY_BLOCK_TOTAL_BYTES
+		                     + (unsigned)REPLAY_BLOCK_THUMB_BYTES
+		                     + 16u * 1024u * 1024u;
+		return (bytes + 0x3FFFFFu) & ~0x3FFFFFu;
+	}
+
+	// The shipped default, shared with Config so the early path - which reads the
+	// ini through WinAPI and cannot touch Config at all - falls back to the same
+	// number when the key is absent from an older ini.
+	inline constexpr int REPLAY_BLOCKS_DEFAULT = 128;
+
+	// Section and key, likewise shared so the two readers cannot disagree.
+	inline constexpr const char* INI_SECTION           = "RockstarEditorPlus";
+	inline constexpr const char* INI_KEY_REPLAY_BLOCKS = "ReplayBlocks";
+
+	// -------------------------------------------------------------------------
 	// Game allocator, Enhanced only.  alloc(size) -> allocAligned(size,16,0,0)
 	//
 	// Needed because Enhanced inlines atArray::Grow, so growing
@@ -624,12 +1167,20 @@ namespace gsig
 	inline constexpr int NAV_RIGHT = 0xBE;
 	inline constexpr int NAV_LEFT  = 0xBD;
 
-	// Option id stamped on our injected rows. MUST stay < MARKER_MENU_OPTION_MAX
-	// (0x28): sc_EditMarkerMenuHelpText is a fixed array indexed directly by
-	// this value, so an invented id would read past its end. 0x27 is the last
-	// valid entry (HELP_TEXT) and is handled by neither the accept path nor the
-	// toggle switch, so a row carrying it is inert if it ever reaches stock
-	// code. We identify our rows by menu index, never by this id.
+	// Option id stamped on our injected rows.
+	//
+	// MUST stay < MARKER_MENU_OPTION_MAX (0x28). That was an inference; it is now
+	// CONFIRMED on both builds - UpdateMenuHelpText indexes sc_EditMarkerMenuHelpText
+	// with the option id and has no upper bound on either side, so an invented id
+	// reads past the array and hands whatever it finds to TheText::Get. See
+	// PLAYBACK_UPDATEMENUHELPTEXT above.
+	//
+	// 0x27 is MARKER_MENU_OPTION_HELP_TEXT, the last valid entry, and its help
+	// string is "" - which is exactly why our rows carried a blank help line
+	// until we started hooking that function. It is handled by neither the accept
+	// path nor the toggle switch, so a row carrying it is inert if it ever
+	// reaches stock code, which is the property we actually want from it. We
+	// identify our rows by menu index plus this id, never by either alone.
 	inline constexpr int OURS_OPTION_ID = 0x27;
 
 	// Stock ids from eMARKER_MENU_OPTIONS, read out of the retail decompile.

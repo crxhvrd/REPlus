@@ -11,6 +11,7 @@
 #include "replay/shake.h"
 #include "utils/paths.h"
 #include "utils/log.h"   // migrateRenderIni logs; do not rely on the .cpp's include order
+#include "game/signatures.h"   // REPLAY_BLOCKS_MIN/MAX - clamp against the engine's own range
 #include <cstdlib>
 
 // RockstarEditorPlus.ini, read once from beside the .asi.
@@ -216,6 +217,28 @@ struct Config
 	bool  unlimitedCameraDistance = true;
 	float maxCameraDistance       = 20000.0f;
 
+	// How many 4 MB blocks the replay RECORDER gets.
+	//
+	// This is what decides how long a clip can be, and why that length changes
+	// with the scene: recording writes into a ring of fixed blocks, so a street
+	// full of traffic fills them in seconds where an empty road lasts a minute.
+	// It is a memory budget, not a timer.
+	//
+	// Stock is 7 (28 MB), which is what this ships as - the feature is opt-in
+	// because it is the one setting that costs real memory. 20 blocks is 80 MB
+	// and roughly triples recording length.
+	//
+	// Going above the count the game settles on needs the replay heap widened
+	// first; limits.cpp does that and clamps back down if it could not. Values
+	// outside the supported range are clamped.
+	// 128, not the game's 30. It is measured rather than optimistic: 128 blocks
+	// records ~1m45 of dense city where stock gives ~17 seconds, and it has been
+	// run on both builds without a crash. The cost is ~604 MB reserved for the
+	// session, which is the right trade for a tool whose entire job is capturing
+	// footage - being handed a 17-second ceiling by default is the worse
+	// surprise. Anyone tight on memory can drop it; the log states what it got.
+	int replayBlocks = gsig::REPLAY_BLOCKS_DEFAULT;
+
 	// Report every profanity check as passed.
 	//
 	// The check is a Social Club round-trip made when naming a project or an
@@ -225,6 +248,18 @@ struct Config
 	//
 	// It only affects local naming of your own single-player recordings.
 	bool  bypassProfanityFilter = true;
+
+	// Let a clip recorded in first person - or during a cutscene, or with camera
+	// movement disabled - be given a free camera.
+	//
+	// The editor greys the entire Camera submenu on such a clip, so the recorded
+	// view is the only one it will ever have. That is a UI gate and nothing more:
+	// the camera code has no notion of these restrictions, so a marker set to a
+	// free camera plays back normally.
+	//
+	// ON by default. The restriction removes a capability rather than protecting
+	// one, and a clip you cannot re-frame is usually a clip you have to re-record.
+	bool  unlockCameraRestrictions = true;
 
 	// Let the editor camera pass through world geometry, and stop the attach
 	// entity shoving it away.
@@ -253,7 +288,12 @@ struct Config
 	// replaces the camera metadata's MinFov/MaxFov with the values below.
 	// 1..130 is the widest possible - camFrame::SetFov clamps there whatever we
 	// do, and that clamp is shared with every camera in the game.
-	bool  uncapZoom  = false;
+	// ON by default. The stock 0.45x-4.50x range is a gameplay-camera choice,
+	// and this is not a gameplay camera - a long lens is ordinary cinematography
+	// and the range is the first thing anyone runs into. The ends below are
+	// camFrame::SetFov's own clamp, so nothing outside them was ever reachable
+	// and widening to them cannot produce a FOV the engine would refuse.
+	bool  uncapZoom  = true;
 	float zoomMinFov = 1.0f;
 	float zoomMaxFov = 130.0f;
 
@@ -709,7 +749,17 @@ struct Config
 		if (zoomMaxFov > 130.0f) zoomMaxFov = 130.0f;
 		if (zoomMaxFov < zoomMinFov) zoomMaxFov = zoomMinFov;
 		bypassProfanityFilter   = getBool("BypassProfanityFilter", bypassProfanityFilter);
+		unlockCameraRestrictions = getBool("UnlockCameraRestrictions", unlockCameraRestrictions);
 		maxCameraDistance       = getFloat("MaxCameraDistance", maxCameraDistance);
+
+		replayBlocks = GetPrivateProfileIntA("RockstarEditorPlus", "ReplayBlocks",
+			replayBlocks, ini.c_str());
+		// Only the outer bound here. Anything above the engine's own 36 needs the
+		// replay HEAP widened first, and whether that is possible is not knowable
+		// until the signatures have resolved - so limits::install() makes that
+		// call and clamps this back to 36 if it could not.
+		if (replayBlocks < gsig::REPLAY_BLOCKS_MIN)      replayBlocks = gsig::REPLAY_BLOCKS_MIN;
+		if (replayBlocks > gsig::REPLAY_BLOCKS_HARD_MAX) replayBlocks = gsig::REPLAY_BLOCKS_HARD_MAX;
 
 		renderFps          = rFloat("RenderFps", renderFps);
 		renderSamples      = rInt("RenderSamples", renderSamples);

@@ -794,6 +794,28 @@ namespace smoothblend
 			if (!(t > 0.0f)) t = 0.0f;
 			if (t > 1.0f)    t = 1.0f;
 			u = t;
+
+			// Camera speed at this instant, for shake coupling.
+			//
+			// Differentiated from spline::hermitePos - the curve this branch
+			// actually drives the camera with - rather than from a distance
+			// profile, which natural pacing never builds. Without it
+			// s_pathSpeedValid stayed false on the SHIPPING DEFAULT, so the
+			// whole motion-coupling block was silently inert: ShakeSpeedAmp,
+			// ShakeSpeedFreq, ShakeStopWhenStill and the menu's Shake: Motion
+			// group all read as "speed not known this tick" and contributed
+			// nothing. Turning any of them up did visibly nothing unless you
+			// also moved the Speed Profile off Natural, which nothing said.
+			//
+			// A CENTRED difference on a function of project time, exactly like
+			// the two branches below: scrub to t, get the same speed, and a
+			// re-render still matches the take that was approved.
+			constexpr float kH = 8.0f;   // ms
+			const Vec3 ctrl[4] = { c1, c2, c3, c4 };
+			const Vec3 pA = spline::hermitePos(ctrl, tk, now - kH);
+			const Vec3 pB = spline::hermitePos(ctrl, tk, now + kH);
+			s_pathSpeed      = (pB - pA).length() / (2.0f * kH * 0.001f);
+			s_pathSpeedValid = true;
 		}
 		else if (cfg.smoothSpeedProfile && !ms.has(rsettings::P_EASE_IN) && !ms.has(rsettings::P_EASE_OUT))
 		{
@@ -1388,6 +1410,13 @@ namespace smoothblend
 		// or abort cleanly if the mod is toggled off mid-way.
 		render::pump();
 
+		// Follow the editor to whichever project and clip are open, so per-marker
+		// settings stop leaking across clips. Must run BEFORE the flush below:
+		// a project change saves the outgoing store, and doing that after tick()
+		// would let the debounce write the outgoing entries under the incoming
+		// project's filename.
+		rsettings::syncScope();
+
 		// Deferred flush of per-marker settings. Cheap: a compare until the
 		// store has actually been quiet for half a second. See rsettings::tick.
 		rsettings::tick();
@@ -1403,6 +1432,11 @@ namespace smoothblend
 		// behave the same whether or not the spline is switched on.
 		limits::applyDistanceLimit(self);
 		limits::applyZoomLimit(self);
+
+		// Late hooks. Reaching IsMarkerControlEditable means going through the
+		// marker storage, which does not exist until a clip is open - so this
+		// cannot be done from install() and has to be retried until it takes.
+		limits::tick();
 
 		if (!Config::get().enabled) return;
 

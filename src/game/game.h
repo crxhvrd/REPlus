@@ -62,6 +62,54 @@ namespace game
 	void setEditorHudVisible(bool visible);
 	bool editorHudControllable();
 
+	// CReplayMgrInternal::SetupReplayBuffer(u16 normalBlocks, u16 tempBlocks).
+	// Recording length is a memory budget, and this is where it is set - see the
+	// note in signatures.h. Optional: unresolved just leaves stock 7 blocks.
+	extern uintptr_t addr_SetupReplayBuffer;
+
+	// CReplayMgrInternal::IsPlaybackFlagSet(u32). Reads the flags off the frame
+	// packet being played, so it answers per FRAME rather than per clip - which
+	// is exactly why clearing the clip's aggregate flags does not reach it. The
+	// camera director gates the free camera on it. Optional; unresolved just
+	// leaves a first-person clip stuck with its recorded camera.
+	extern uintptr_t addr_IsPlaybackFlagSet;
+
+	// CReplayBufferInfo. The LIVE block counts live here, and they are not the
+	// configured ones - the temp buffer borrows blocks out of the recording ring
+	// while a save is in flight. See signatures.h for the layout.
+	extern uintptr_t addr_g_ReplayBufferInfo;
+
+	// u16 CReplayMgrInternal::NumberOfReplayBlocks. THE value the recording path
+	// reads; writing it is what actually lifts the limit, since it needs no hook
+	// to have been installed before the call that consumes it.
+	extern uintptr_t addr_g_ReplayBlocks;
+
+	// u16 TotalNumberOfReplayBlocks. Enable() clamps it to 42 just before the
+	// buffer is set up, and it - not the count handed to SetupReplayBuffer - is
+	// what bounds how much of the buffer a recording actually uses. Enhanced
+	// only. 0 = the clamp stands and the budget cannot exceed stock.
+	extern uintptr_t addr_g_ReplayTotalBlocks;
+
+	// The replay allocator object. Its vtable slot is null until the replay heap
+	// is built at process start, so reading it at install time is what tells us
+	// whether we are early enough to resize that heap at all. See signatures.h.
+	extern uintptr_t addr_g_ReplayAllocator;
+
+	// Addresses of the two 0xAC00000 immediates that size the replay heap - the
+	// reservation and the allocator's own idea of its extent. Both or neither;
+	// see signatures.h.
+	extern uintptr_t addr_ReplayHeapAllocImm;
+	extern uintptr_t addr_ReplayHeapCtorImm;
+
+	// Set when the pool was widened at DLL attach instead of at install - the
+	// FiveM path, where install happens far too late to be of any use.
+	//
+	// It also means the two addresses above did NOT come from a scan and cannot
+	// be re-found by one: the patterns key on the stock size immediate, so
+	// rewriting that immediate stops them matching their own site. Anything that
+	// re-derives them has to leave the early values alone.
+	extern bool replayHeapWidenedEarly;
+
 	extern uintptr_t addr_SetCursorSpeed;        // CReplayMgrInternal::SetCursorSpeed(float)
 	extern uintptr_t addr_SetNextPlayBackState;  // CReplayMgrInternal::SetNextPlayBackState(u32)
 	extern uintptr_t addr_g_ReplayMode;          // int, CReplayMgr mode (2 = EDIT)
@@ -124,6 +172,10 @@ namespace game
 	extern uintptr_t addr_g_MenuOptions;       // atArray{ void* data; u16 count; u16 cap }
 	extern uintptr_t addr_g_MenuFocusIndex;    // int
 	extern uintptr_t addr_UpdateItemText;      // void(int index, const char* text)
+	// void(s32 menuIndex). The help-text choke point - every populate tail and
+	// every focus change goes through it. Hooked so our rows carry a real help
+	// line; optional, and without it they simply show a blank one as before.
+	extern uintptr_t addr_UpdateMenuHelpText;
 
 	// Enhanced-only; 0 on Legacy, which never reads them. Enhanced inlines
 	// atArray::Grow and GetCurrentEditMarker, and threads a context object
@@ -133,6 +185,18 @@ namespace game
 	extern uintptr_t addr_GameFree;            // void(void*)
 	extern uintptr_t addr_g_EditClipController;// CVideoProjectPlaybackController*
 	extern uintptr_t addr_g_EditClipIndex;     // int
+
+	// The open project. On Enhanced this is the SAME pointer as
+	// g_EditClipController above - that name is a misnomer kept for continuity:
+	// what menu.cpp reads at +0x320 as "the clip array" is really the montage,
+	// whose clip array happens to sit at its start.
+	extern uintptr_t addr_g_Project;
+
+	// Name of the project currently open in the editor, or nullptr when there
+	// is none / it could not be read. Points into game memory, so copy it if you
+	// need to keep it. Used to scope per-marker settings so two projects stop
+	// sharing one side-car file.
+	const char* projectName();
 
 	// True when every menu address above resolved.
 	bool menuReady();

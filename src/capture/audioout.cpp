@@ -40,6 +40,13 @@ namespace audioout
 		uint32_t s_dataBytes = 0;
 		int      s_restarts  = 0;
 
+		// A pump thread that would not stop still owns s_client, s_capture and
+		// s_file, so end() deliberately leaks them rather than freeing memory the
+		// thread is about to touch. Once that has happened there is no safe way to
+		// hand a second pass a fresh FILE* - the old thread may still be writing
+		// through the same static - so recording stays off for the session.
+		bool s_abandoned = false;
+
 		volatile bool s_run  = false;
 		volatile bool s_gate = false;
 		volatile bool s_live = false;
@@ -269,6 +276,13 @@ namespace audioout
 	bool begin(const char* folder)
 	{
 		if (s_live) return true;
+		if (s_abandoned)
+		{
+			logger::write("info",
+				"audio: an earlier capture thread never stopped - not starting another. "
+				"Renders stay silent until the game is restarted.");
+			return false;
+		}
 		s_dataBytes = 0;
 		s_restarts  = 0;
 		s_path[0]   = '\0';
@@ -315,12 +329,43 @@ namespace audioout
 		s_run  = false;
 		s_gate = false;
 
+		// Join, and mean it.
+		//
+		// The pump can be inside activate(), which waits up to 3s on the
+		// activation handler - so the old 2s bound could return while the thread
+		// was still running, and everything below then tore down state it was
+		// about to use. Two real consequences: the freshly Start()ed IAudioClient
+		// the thread assigns on its way out was never released, leaking a LIVE
+		// capture stream for the rest of the process, and fclose(s_file) raced its
+		// next fwrite. Stream loss is what happens at a clip boundary, so that is
+		// an ordinary multi-clip audio pass, not a hypothetical.
+		//
+		// 5s comfortably dominates the worst legitimate case (a 3s activate, the
+		// 100ms backoff, a 200ms event wait). Bounded rather than INFINITE because
+		// this runs on the game's main thread - a wedged pump must not take the
+		// editor down with it.
+		bool joined = true;
 		if (s_thread)
 		{
-			WaitForSingleObject(s_thread, 2000);
+			joined   = WaitForSingleObject(s_thread, 5000) == WAIT_OBJECT_0;
 			CloseHandle(s_thread);
 			s_thread = nullptr;
 		}
+
+		// It did not stop. The thread still owns the capture client and the FILE*,
+		// so releasing either here is precisely the bug this join exists to
+		// prevent - leak them on purpose and take the pass as silent.
+		if (!joined)
+		{
+			s_abandoned = true;
+			s_live      = false;
+			s_path[0]   = '\0';   // so path() reports nothing usable was recorded
+			logger::write("info",
+				"audio: the capture thread did not stop - leaving the stream and the wav "
+				"to it rather than freeing them underneath it. This render is silent.");
+			return;
+		}
+
 		deactivate();
 
 		if (s_file)

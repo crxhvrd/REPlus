@@ -17,10 +17,10 @@ static void (*origGetSystemTimeAsFileTime)(LPFILETIME) = nullptr;
 // normal start path and the FiveM one so the two cannot drift.
 static void InstallResolved()
 {
-	// Single shared store for now. Per-project separation needs the active clip
-	// name, which we do not resolve yet вЂ” until then all projects share one file,
-	// so marker times from different clips could in principle collide.
-	rsettings::bindProject("default");
+	// Per-marker settings bind themselves - rsettings::syncScope() picks up the
+	// open project and edited clip once the editor is up. Nothing to do here:
+	// there is no project open at process start, and binding one now would only
+	// create a file that the first real bind immediately replaces.
 
 	fxcapture::init();
 	render::applyConfig();
@@ -62,6 +62,277 @@ static void HookGetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
 		}
 	}
 	origGetSystemTimeAsFileTime(lpSystemTimeAsFileTime);
+}
+
+// ---------------------------------------------------------------------------
+//  Is the replay heap already committed by the time we get here?
+// ---------------------------------------------------------------------------
+//  Under FiveM the answer decides whether long recordings are reachable AT ALL.
+//  Recording length is a memory budget out of one 172 MB pool, and widening that
+//  pool means editing the size immediate BEFORE the allocation runs. On the
+//  normal start path we are early enough. Under FiveM we are not: init is handed
+//  to ScriptHookV, whose script thread did not run until 35 seconds after attach
+//  in testing, by which point the pool is long since committed and the block
+//  count clamps back to stock.
+//
+//  So the real question is whether there is a window between DLL attach and that
+//  allocation. This answers it and nothing else - it is READ-ONLY on purpose.
+//  Building the early-patch path before knowing the window exists would be
+//  writing code that cannot work.
+//
+//  Deliberately free of the CRT. memory::scan opens with a function-local static
+//  lambda and a std::vector, and a function-local static is exactly what faulted
+//  inside msvcp140 when an earlier attempt ran the install from this thread (see
+//  the note on FiveMRegisterThread). Everything here is stack arrays, raw loops
+//  and WinAPI, so there is no static-init guard to trip.
+// ---------------------------------------------------------------------------
+namespace earlyprobe
+{
+	// Pattern scan over the game image. 'x' matches, '?' is a wildcard.
+	static const unsigned char* rawScan(const unsigned char* pat, const char* mask, int len)
+	{
+		const auto* base = (const unsigned char*)GetModuleHandleA(nullptr);
+		if (!base) return nullptr;
+
+		const auto* dos = (const IMAGE_DOS_HEADER*)base;
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+		const auto* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+		const size_t size = nt->OptionalHeader.SizeOfImage;
+		if (size <= (size_t)len) return nullptr;
+
+		for (size_t i = 0; i <= size - (size_t)len; ++i)
+		{
+			int j = 0;
+			for (; j < len; ++j)
+				if (mask[j] == 'x' && base[i + j] != pat[j]) break;
+			if (j == len) return base + i;
+		}
+		return nullptr;
+	}
+
+	// Parse a signature string into bytes+mask. Same text the normal path feeds
+	// memory::scan, so the two cannot drift onto different patterns - but done
+	// with stack buffers instead of a std::vector.
+	static int parseSig(const char* sig, unsigned char* pat, char* mask, int cap)
+	{
+		auto hex = [](char c) -> int {
+			if (c >= '0' && c <= '9') return c - '0';
+			if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+			if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+			return -1;
+		};
+
+		int n = 0;
+		for (const char* p = sig; *p && n < cap; )
+		{
+			if (*p == ' ') { ++p; continue; }
+			if (*p == '?')
+			{
+				while (*p == '?') ++p;      // '?' and '??' both mean one byte
+				pat[n] = 0; mask[n] = '?'; ++n;
+				continue;
+			}
+			const int hi = hex(*p);
+			if (hi < 0) { ++p; continue; }
+			const int lo = hex(p[1]);
+			pat[n]  = (unsigned char)(lo < 0 ? hi : (hi << 4) | lo);
+			mask[n] = 'x';
+			++n;
+			p += (lo < 0 ? 1 : 2);
+		}
+		return n;
+	}
+
+	static const unsigned char* scanSig(const char* sig)
+	{
+		unsigned char pat[64]{};
+		char          mask[64]{};
+		const int len = parseSig(sig, pat, mask, 64);
+		return len ? rawScan(pat, mask, len) : nullptr;
+	}
+
+	// ReplayBlocks, straight out of the ini.
+	//
+	// Config cannot be used here - it is std::string all the way down and this
+	// runs on the thread that must not touch the CRT - so the ini is read through
+	// WinAPI instead. Section and key come from signatures.h so the two readers
+	// cannot disagree about what they are reading.
+	static int iniReplayBlocks()
+	{
+		char path[MAX_PATH]{};
+		HMODULE self = nullptr;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		                   (LPCSTR)&iniReplayBlocks, &self);
+		GetModuleFileNameA(self, path, MAX_PATH);
+
+		char* slash = nullptr;
+		for (char* p = path; *p; ++p) if (*p == '\\') slash = p;
+		if (!slash) return gsig::REPLAY_BLOCKS_DEFAULT;
+		*(slash + 1) = '\0';
+		lstrcatA(path, "RockstarEditorPlus\\RockstarEditorPlus.ini");
+
+		int n = GetPrivateProfileIntA(gsig::INI_SECTION, gsig::INI_KEY_REPLAY_BLOCKS,
+		                              -1, path);
+
+		// The mod falls back to %LOCALAPPDATA% when its own folder is not
+		// writable, so look there too before assuming the default.
+		if (n < 0)
+		{
+			char alt[MAX_PATH]{};
+			if (GetEnvironmentVariableA("LOCALAPPDATA", alt, MAX_PATH))
+			{
+				lstrcatA(alt, "\\RockstarEditorPlus\\RockstarEditorPlus.ini");
+				n = GetPrivateProfileIntA(gsig::INI_SECTION, gsig::INI_KEY_REPLAY_BLOCKS,
+				                          -1, alt);
+			}
+		}
+
+		// Absent means an ini written before the option existed. Use the shipped
+		// default rather than doing nothing, so an older ini still benefits.
+		return n < 0 ? gsig::REPLAY_BLOCKS_DEFAULT : n;
+	}
+
+	static bool patchImm32(void* at, unsigned value)
+	{
+		DWORD old = 0;
+		if (!VirtualProtect(at, sizeof(value), PAGE_EXECUTE_READWRITE, &old)) return false;
+		memcpy(at, &value, sizeof(value));
+		VirtualProtect(at, sizeof(value), old, &old);
+		FlushInstructionCache(GetCurrentProcess(), at, sizeof(value));
+		return true;
+	}
+
+	// Widen the replay pool before the game commits it.
+	//
+	// The normal install does this too, and does it better - it has Config, real
+	// logging and every address already resolved. This exists only because under
+	// FiveM that install happens ~20-35 seconds too late. Everything here is the
+	// same decision made with worse tools, so it stays conservative: it refuses
+	// on anything unexpected rather than guessing, and it is a no-op unless the
+	// ini actually asks for more blocks than the stock pool holds.
+	static void widenReplayHeap()
+	{
+		const unsigned char* alloc = scanSig(gsig::REPLAY_HEAP_ALLOC_SITE.leg);
+		if (!alloc)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - reservation site not found, "
+				"leaving the pool at stock");
+			return;
+		}
+
+		// Has the pool already been committed? The allocator object is a static,
+		// so its first qword is null until its constructor has run. Validate the
+		// lea before trusting its displacement: a displacement read from the wrong
+		// place gives a plausible pointer that only fails on dereference.
+		if (alloc[0x10] != 0x48 || alloc[0x11] != 0x8D || alloc[0x12] != 0x2D)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - no lea at +0x10, build "
+				"drifted, leaving the pool at stock");
+			return;
+		}
+		int32_t disp = 0;
+		memcpy(&disp, alloc + 0x13, sizeof(disp));
+		const void* built = *(void* const*)(alloc + 0x17 + disp);
+		if (built)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap ALREADY BUILT at attach (%p) - "
+				"too late even here; recording stays at stock length", built);
+			return;
+		}
+
+		int blocks = iniReplayBlocks();
+		if (blocks > gsig::REPLAY_BLOCKS_HARD_MAX) blocks = gsig::REPLAY_BLOCKS_HARD_MAX;
+		if (blocks <= gsig::REPLAY_BLOCKS_SAFE_MAX)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - ReplayBlocks=%d fits the "
+				"stock pool, nothing to widen", blocks);
+			return;
+		}
+
+		const unsigned char* ctor = scanSig(gsig::REPLAY_HEAP_CTOR_SITE.leg);
+		if (!ctor)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - only one of the two size "
+				"sites found; both or neither, so leaving the pool at stock");
+			return;
+		}
+
+		auto* allocImm = (void*)(alloc + gsig::RHA_SIZE_IMM_OFF);
+		auto* ctorImm  = (void*)(ctor  + gsig::RHC_SIZE_IMM_OFF_LEG);
+
+		// Both must currently read the stock size. If either does not, something
+		// else has been here or the pattern landed off by a few bytes, and
+		// writing a size into the wrong instruction is far worse than not
+		// widening at all.
+		unsigned a = 0, c = 0;
+		memcpy(&a, allocImm, sizeof(a));
+		memcpy(&c, ctorImm,  sizeof(c));
+		if (a != gsig::REPLAY_HEAP_STOCK_BYTES || c != gsig::REPLAY_HEAP_STOCK_BYTES)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - size immediates read "
+				"0x%X / 0x%X, expected 0x%X. Not touching them.",
+				a, c, gsig::REPLAY_HEAP_STOCK_BYTES);
+			return;
+		}
+
+		const unsigned bytes = gsig::replayHeapBytesFor(blocks);
+
+		// Can this machine actually give the game that reservation? Ask for it
+		// ourselves and hand it straight back. The game's own attempt has no
+		// failure path we survive - it never checks the null it gets from a short
+		// pool - so the only safe place to find out is before it tries.
+		void* probe = VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+		if (!probe)
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - cannot reserve %u MB in this "
+				"process, leaving the pool at stock", bytes / (1024u * 1024u));
+			return;
+		}
+		VirtualFree(probe, 0, MEM_RELEASE);
+
+		if (!patchImm32(allocImm, bytes) || !patchImm32(ctorImm, bytes))
+		{
+			logger::write("info",
+				"RockstarEditorPlus: [FiveM] replay heap - could not write the size "
+				"immediates");
+			return;
+		}
+
+		// Hand the sites to the normal install, which will NOT be able to find
+		// them for itself.
+		//
+		// The patterns match on the stock size immediate - `B9 00 00 C0 0A` is
+		// literally the first five bytes of the reservation one - so the moment
+		// that immediate is rewritten the pattern stops matching its own site.
+		// The first version of this widened the pool correctly and then watched
+		// the install report "heap size sites unresolved" and clamp the block
+		// count back to 30, with a 604 MB pool sitting right there.
+		//
+		// Passing the addresses across is exact. Loosening the patterns to
+		// wildcard the immediate would work too, but it would cost four bytes of
+		// uniqueness on a pattern whose distinctiveness is mostly that immediate.
+		//
+		// Plain stores to zero-initialised globals - nothing here needs the CRT.
+		game::addr_ReplayHeapAllocImm  = (uintptr_t)allocImm;
+		game::addr_ReplayHeapCtorImm   = (uintptr_t)ctorImm;
+		game::replayHeapWidenedEarly   = true;
+
+		logger::write("info",
+			"RockstarEditorPlus: [FiveM] replay heap %u -> %u MB for %d+%d blocks, "
+			"patched at attach - before the game commits it",
+			gsig::REPLAY_HEAP_STOCK_BYTES / (1024u * 1024u), bytes / (1024u * 1024u),
+			blocks, gsig::REPLAY_TEMP_BLOCKS);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +412,17 @@ static HMODULE g_selfModule = nullptr;
 
 static DWORD WINAPI FiveMRegisterThread(LPVOID)
 {
+	// Before anything else, and before the wait below burns the only early
+	// moment we get. Read-only, and wrapped because a fault here would take the
+	// game's startup with it - the answer is worth one log line, not a crash.
+	__try { earlyprobe::widenReplayHeap(); }
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		logger::write("info",
+			"RockstarEditorPlus: [FiveM] replay heap widen faulted - ignoring, the "
+			"pool stays at stock");
+	}
+
 	// A thread is still wanted, but only for WAITING. scripthookv may not be
 	// loaded yet at DLL_PROCESS_ATTACH, and LoadLibrary from DllMain is not an
 	// option, so poll for it. ~60s at 250ms.
@@ -171,8 +453,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 		DisableThreadLibraryCalls(hModule);
 
 
-		Config::get().load(hModule);
+		// The logger comes up BEFORE the config, and that ordering is load-bearing:
+		// init() TRUNCATES the log, and Config::load() writes to it. The one-time
+		// split of the render settings into Render.ini logs itself from inside
+		// migrateRenderIni, and that line was being deleted a moment after it was
+		// written - on the single run it can ever appear, and the one where the
+		// mod rewrites somebody's settings. Neither call depends on the other;
+		// both need only paths::, which is self-contained.
 		logger::init();
+
 		// Stamp the build on the first line.
 		//
 		// Triaging user reports without this is guesswork: most of what a fix
@@ -181,6 +470,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved)
 		// "is this the latest .asi?" round trip in a bug report is this line
 		// missing.
 		logger::write("info", "RockstarEditorPlus: attached (build " __DATE__ " " __TIME__ ")");
+
+		Config::get().load(hModule);
 
 		if (paths::usingFallbackDir())
 			logger::write("info",

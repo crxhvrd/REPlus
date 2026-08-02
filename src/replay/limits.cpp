@@ -70,6 +70,137 @@ namespace limits
 			return origComputeSafePos(self, entity, cameraPos);
 		}
 
+		// =====================================================================
+		//  How long a clip can be
+		// =====================================================================
+		//  Not a duration limit - a MEMORY one, which is why the answer changes
+		//  with the scene. CReplayMgrInternal records into a ring of fixed 4 MB
+		//  blocks and a busy street fills them in seconds where an empty road
+		//  lasts a minute. Stock is 7 blocks, 28 MB.
+		//
+		//  SetupReplayBuffer is the whole patch: it compares the request against
+		//  what is allocated, and frees and reallocates itself when the request
+		//  grows. So we raise one argument and the engine does the rest - no
+		//  allocator of ours, no startup timing to get right, and because it
+		//  only grows on demand it sizes the buffer once and never churns.
+		//
+		//  See signatures.h for why 36 is a hard ceiling and why this is viable
+		//  on PC at all.
+		// =====================================================================
+		using FnSetupReplayBuffer = char(__fastcall*)(unsigned short, unsigned short);
+		FnSetupReplayBuffer origSetupReplayBuffer = nullptr;
+
+		// The LIVE block counts, for the one line we log on a successful setup.
+		//
+		// Worth reporting rather than assuming: the configured pair is what we
+		// asked for, and the engine moves blocks between the normal and temp
+		// rings while a save is in flight, so the two can differ. They did
+		// not in testing, but "the ring is what we set it to" is the whole
+		// premise of the feature and it costs one read to state it as fact.
+		void appendRing(char* out, int cap)
+		{
+			if (!game::addr_g_ReplayBufferInfo) { out[0] = '\0'; return; }
+			const auto* b = (const unsigned char*)game::addr_g_ReplayBufferInfo;
+			auto u16at = [b](int off) { return *(const unsigned short*)(b + off); };
+
+			snprintf(out, cap, ", ring %u+%u of %u allocated",
+				u16at(gsig::BUFINFO_CURRENTBLOCKS), u16at(gsig::BUFINFO_CURRENTTEMP),
+				u16at(gsig::BUFINFO_ALLOCATED_OFF));
+		}
+
+		char __fastcall hkSetupReplayBuffer(unsigned short normal, unsigned short temp)
+		{
+			const int want = Config::get().replayBlocks;
+
+			// ONLY the recording setup. Loading a clip calls this as
+			// (header.PhysicalBlockCount, 0) and teardown as (0, 0), so a
+			// non-zero temp count is what marks the recording path. Inflating a
+			// LOAD would tell the buffer it holds more blocks than the clip ever
+			// wrote, and playback would walk blocks nothing filled.
+			if (temp == 0) return origSetupReplayBuffer(normal, temp);
+
+			// `normal` usually already carries our value, because the global we
+			// write at install is what this call site loads. Raising here as
+			// well only matters when the write was overwritten by a settings
+			// apply between the two.
+			unsigned short use = normal;
+			if (want > (int)use) use = (unsigned short)want;
+
+			// Lift the clamp Enable() just applied.
+			//
+			// TotalNumberOfReplayBlocks is capped at 42 a few instructions
+			// before this call, and IT is what bounds how
+			// much of the buffer a recording actually uses - not the count we pass
+			// below. Left alone, a 70-block buffer records 42 blocks' worth and
+			// stops: 24 seconds where the allocation was good for 35.
+			//
+			// Written here rather than patched because the clamp has already run
+			// by the time we are called, and nothing reads the value until after.
+			//
+			// BOTH globals, and that is not belt-and-braces. The engine
+			// recomputes the total as
+			//     TotalNumberOfReplayBlocks = NumberOfReplayBlocks + NumberOfTempReplayBlocks
+			// so leaving NumberOfReplayBlocks at the settings value (30, which is
+			// what arrives as `normal`) means the next recompute puts the total
+			// straight back to 36 and undoes the line above. Our install-time
+			// write to this global is overwritten by the settings apply long
+			// before recording starts, which is why it has to happen again here.
+			if (game::addr_g_ReplayBlocks)
+				*(unsigned short*)game::addr_g_ReplayBlocks = use;
+			if (game::addr_g_ReplayTotalBlocks)
+				*(unsigned short*)game::addr_g_ReplayTotalBlocks =
+					(unsigned short)(use + temp);
+
+			// Descending retry.
+			//
+			// Above the engine's own 36 this is an experiment, and the failure
+			// mode is unforgiving: a failed SetupReplayBuffer has ALREADY called
+			// FreeMemory, so simply returning false leaves the game with no
+			// recording buffer at all - no clips, no error the user can read.
+			//
+			// So walk the request down until something takes, ending at the
+			// count the game asked for. An over-ambitious ReplayBlocks then
+			// costs a shorter clip and a log line, never a broken recorder.
+			unsigned short attempt = use;
+			for (;;)
+			{
+				if (const char ok = origSetupReplayBuffer(attempt, temp))
+				{
+					static int s_reported = 0;
+					if (s_reported != (int)attempt)
+					{
+						s_reported = attempt;
+						char ring[64];
+						appendRing(ring, sizeof(ring));
+						logger::write("info",
+							"limits: recording buffer = %u blocks (%d MB, +%u temp)%s%s",
+							attempt,
+							((int)attempt * gsig::REPLAY_BLOCK_BYTES) / (1024 * 1024), temp,
+							ring,
+							attempt > gsig::REPLAY_BLOCKS_SAFE_MAX
+								? "  [above the game's own 30]" : "");
+					}
+					return ok;
+				}
+
+				if (attempt <= normal)
+				{
+					logger::write("info",
+						"limits: !! SetupReplayBuffer failed even at the game's own %u "
+						"blocks - recording is broken, and this is not our doing.", normal);
+					return 0;
+				}
+
+				const unsigned short next = (unsigned short)(attempt / 2) > normal
+					? (unsigned short)(attempt / 2) : normal;
+				logger::write("info",
+					"limits: could not allocate %u replay blocks (%d MB) - retrying at %u. "
+					"Lower ReplayBlocks in the ini to stop this happening every time.",
+					attempt, ((int)attempt * gsig::REPLAY_BLOCK_BYTES) / (1024 * 1024), next);
+				attempt = next;
+			}
+		}
+
 		// Report every profanity check as already passed. The situation this
 		// exists for: the check cannot complete offline, and the editor treats
 		// an unavailable filter as a hard failure rather than skipping it.
@@ -82,6 +213,141 @@ namespace limits
 				return gsig::PROFANITY_RESULT_STRING_OK;
 			return origProfanityStatus(token);
 		}
+
+		// ---------------------------------------------------------------------
+		//  Editing a clip that was recorded in first person
+		// ---------------------------------------------------------------------
+		//  Record anything from the first-person view and the editor will not let
+		//  you put a free camera on it - the whole Camera submenu is greyed, so
+		//  the clip is stuck with the recorded view forever.
+		//
+		//  It is one virtual: IsMarkerControlEditable(control). For the camera
+		//  controls it answers FIRST_PERSON / CUTSCENE / CAMERA_BLOCKED depending
+		//  on flags baked into the recording, and any non-zero answer disables the
+		//  row. Answering NONE for the camera controls is the whole unlock -
+		//  nothing in the camera code consults it, so once the menu lets a marker
+		//  be set to a free camera, the camera simply runs it.
+		//
+		//  Only the CAMERA controls are overridden. The same virtual answers for
+		//  volume and DOF rows, and those restrictions are about a marker having
+		//  no audio or DOF being off in the graphics options - real conditions
+		//  where the row genuinely has nothing to edit. Blanket-clearing would
+		//  turn those into rows that accept input and do nothing.
+		using FnIsEditable = unsigned(__fastcall*)(void*, int);
+		FnIsEditable origIsEditable = nullptr;
+
+		unsigned __fastcall hkIsEditable(void* storage, int control)
+		{
+			const unsigned stock = origIsEditable(storage, control);
+
+			if (!Config::get().unlockCameraRestrictions) return stock;
+			if (control != gsig::MARKER_CONTROL_CAMERA &&
+			    control != gsig::MARKER_CONTROL_CAMERA_TYPE) return stock;
+
+			// IS_ANCHOR / IS_ENDPOINT / NEEDS_BLEND are structural - the first and
+			// last markers of a clip really cannot take an arbitrary camera, and
+			// clearing those produces a marker the game cannot play back. Only the
+			// three RECORDING-derived reasons are lifted.
+			if (stock != gsig::EDIT_RESTRICTION_FIRST_PERSON &&
+			    stock != gsig::EDIT_RESTRICTION_CUTSCENE &&
+			    stock != gsig::EDIT_RESTRICTION_CAMERA_BLOCKED) return stock;
+
+			static unsigned s_reported = ~0u;
+			if (s_reported != stock)
+			{
+				s_reported = stock;
+				static const char* const kWhy[] = {
+					"none", "first person", "cutscene", "camera blocked" };
+				logger::write("info", "limits: camera unlocked on a '%s' clip",
+					kWhy[stock < 4 ? stock : 0]);
+			}
+			return gsig::EDIT_RESTRICTION_NONE;
+		}
+
+		// The SECOND lock, and the one that actually froze the camera.
+		//
+		// Unlocking the menu lets a marker be set to a free camera, but the
+		// director never sees that: it asks whether the camera-disabled flag is
+		// set on the frame packet being played, and returns the recorded camera
+		// when it is. Every frame recorded in first person carries that flag.
+		//
+		// The first attempt here cleared the flag on the clip's aggregate global -
+		// and the log proved it landed, 0x9 -> 0x8, with no effect whatsoever. The
+		// aggregate is what the MENU reads; the director reads the per-frame packet
+		// instead. Two different pieces of storage for the same-named flag.
+		//
+		// Answering false for that one bit is the fix. Nothing else is touched:
+		// every caller passes a single flag, and bit 0 has exactly one - the camera
+		// selection. The in-vehicle, aircraft-shadow and first-person-VFX queries
+		// that share this function are passed straight through.
+		using FnIsPlaybackFlagSet = char(__fastcall*)(unsigned);
+		FnIsPlaybackFlagSet origIsPlaybackFlagSet = nullptr;
+
+		char __fastcall hkIsPlaybackFlagSet(unsigned flag)
+		{
+			if (flag == gsig::CLIPFLAG_DISABLE_CAMERA_MOVEMENT &&
+			    Config::get().unlockCameraRestrictions)
+			{
+				static bool s_said = false;
+				if (!s_said)
+				{
+					s_said = true;
+					logger::write("info",
+						"limits: camera-disabled frame flag suppressed - the director "
+						"will honour the marker's camera type");
+				}
+				return 0;
+			}
+			return origIsPlaybackFlagSet(flag);
+		}
+
+		// The virtual is reached through the live marker storage, so it cannot be
+		// hooked until a clip is open. Doing it this way rather than by pattern is
+		// deliberate: the vtable SLOT is the stable thing (offset 0x160 on both
+		// builds), whereas the function body is small, generic and exactly the
+		// kind of code a compiler shuffles between updates.
+		bool s_editableHooked = false;
+
+		void tryHookIsEditable()
+		{
+			if (s_editableHooked) return;
+
+			void* storage = game::markerStorage();
+			if (!storage) return;   // no clip open yet; try again next frame
+
+			void** vtbl = *(void***)storage;
+			if (!vtbl) return;
+
+			void* fn = vtbl[gsig::MARKERSTORAGE_VT_ISEDITABLE / sizeof(void*)];
+
+			// A vtable slot is only as trustworthy as the object it came from, and
+			// this one is read from a global that other code also writes. Refuse
+			// anything that is not executable - hooking a bad address is a crash
+			// with no obvious cause, days later.
+			MEMORY_BASIC_INFORMATION mbi{};
+			if (!fn || !VirtualQuery(fn, &mbi, sizeof(mbi)) ||
+			    mbi.State != MEM_COMMIT ||
+			    !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+			                     PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+			{
+				s_editableHooked = true;   // do not retry every frame forever
+				logger::write("info",
+					"limits: marker-storage slot 0x%X is not code (%p) - first-person "
+					"clips stay locked", gsig::MARKERSTORAGE_VT_ISEDITABLE, fn);
+				return;
+			}
+
+			s_editableHooked = true;
+			memory((uintptr_t)fn).hook(hkIsEditable, &origIsEditable);
+			logger::write("info",
+				"limits: IsMarkerControlEditable hooked at %p (vtable +0x%X)",
+				fn, gsig::MARKERSTORAGE_VT_ISEDITABLE);
+		}
+	}
+
+	void tick()
+	{
+		tryHookIsEditable();
 	}
 
 	// Lift the leash by rewriting the METADATA the check reads, not by hooking
@@ -283,6 +549,174 @@ namespace limits
 		else
 			logger::write("info", "limits: profanity poll unresolved - filter unchanged");
 
+		if (game::addr_IsPlaybackFlagSet)
+			memory(game::addr_IsPlaybackFlagSet).hook(hkIsPlaybackFlagSet, &origIsPlaybackFlagSet);
+		else
+			logger::write("info",
+				"limits: IsPlaybackFlagSet unresolved - a first-person clip keeps "
+				"its recorded camera even with the menu unlocked");
+
+		// THE actual lift: write the count the recording path reads.
+		//
+		// Hooking SetupReplayBuffer was not enough on its own - both recording
+		// call sites load this global, and whether our detour is in place by the
+		// time they run is not something we control. Writing the value has no
+		// such race: whenever the game next sets the buffer up, it reads ours.
+		// The hook stays as a backstop and as the trace that tells us which of
+		// the two actually did the work.
+		const int want = Config::get().replayBlocks;
+		if (game::addr_g_ReplayBlocks)
+		{
+			auto* blocks = (unsigned short*)game::addr_g_ReplayBlocks;
+			const unsigned short before = *blocks;
+
+			if (want != (int)before)
+			{
+				*blocks = (unsigned short)want;
+				logger::write("info",
+					"limits: recording blocks %u -> %d (%d MB). Takes effect at the next "
+					"recording setup; a clip already rolling keeps the old budget.",
+					before, want, (want * gsig::REPLAY_BLOCK_BYTES) / (1024 * 1024));
+			}
+			else
+			{
+				logger::write("info", "limits: recording blocks already %u (%d MB)",
+					before, (want * gsig::REPLAY_BLOCK_BYTES) / (1024 * 1024));
+			}
+		}
+		else
+		{
+			logger::write("info",
+				"limits: replay block count unresolved - recording length unchanged");
+		}
+
+		// =====================================================================
+		//  Widen the replay heap, if we are early enough and it is wanted.
+		// =====================================================================
+		//  36 blocks is not a policy limit - it is the largest count that fits a
+		//  172 MB pool reserved once at rva 0x1020. Widening that reservation is
+		//  the only way past it, and it can only be done before it happens.
+		//
+		//  Sized from what a block ACTUALLY costs: 4 MB for the block plus a
+		//  384 KB thumbnail, with one spare thumbnail on top. The first attempt
+		//  at this used R*'s own (n+1)*4MB and crashed, because their sizing
+		//  ignores the thumbnails - which is also why their own stated maximum
+		//  of 42 blocks does not fit their own heap. Do not copy their formula.
+		//
+		//  Anything that is not certain here CLAMPS instead of guessing, because
+		//  the failure mode is not a refusal - the game never checks the null it
+		//  gets back from a short pool, so an optimistic write crashes it.
+		// =====================================================================
+		{
+			Config& cfg  = const_cast<Config&>(Config::get());
+			const int want = cfg.replayBlocks;
+
+			if (want > gsig::REPLAY_BLOCKS_SAFE_MAX)
+			{
+				// The allocator object's vtable slot. It is a static, so this is
+				// zero until its constructor runs - which is the question:
+				// has the 172 MB pool been committed yet?
+				const void* built = game::addr_g_ReplayAllocator
+					? *(void* const*)game::addr_g_ReplayAllocator
+					: (const void*)1;   // unresolved: assume the worst
+
+				const bool sites = game::addr_ReplayHeapAllocImm &&
+				                   game::addr_ReplayHeapCtorImm;
+
+				const unsigned bytes = gsig::replayHeapBytesFor(want);
+
+				// How big the pool actually IS, rather than how big we assume it
+				// is. This matters because "already built" no longer implies
+				// "still stock": under FiveM the size immediate is patched at DLL
+				// attach, ~20-35 seconds before ScriptHookV hands us this thread,
+				// so by the time we get here the heap is both BUILT and WIDE.
+				// Clamping on builtness alone threw that away and put the user
+				// back on stock recording length.
+				const unsigned pool = sites
+					? *(const unsigned*)game::addr_ReplayHeapAllocImm
+					: gsig::REPLAY_HEAP_STOCK_BYTES;
+
+				// Can this machine actually give the game that reservation? Ask
+				// for it ourselves and hand it straight back. The game's own
+				// attempt has no failure path we survive, so the only safe place
+				// to find out is here, before it tries.
+				bool room = false;
+				if (sites && !built)
+				{
+					if (void* probe = VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS))
+					{
+						VirtualFree(probe, 0, MEM_RELEASE);
+						room = true;
+					}
+				}
+
+				if (sites && !built && room)
+				{
+					memory(game::addr_ReplayHeapAllocImm).put<unsigned>(bytes);
+					memory(game::addr_ReplayHeapCtorImm).put<unsigned>(bytes);
+					logger::write("info",
+						"limits: replay heap %u -> %u MB for %d+%d blocks. Above the "
+						"engine's own 36 - if the game dies on the first recording, "
+						"lower ReplayBlocks.",
+						gsig::REPLAY_HEAP_STOCK_BYTES / (1024u * 1024u),
+						bytes / (1024u * 1024u), want, gsig::REPLAY_TEMP_BLOCKS);
+				}
+				else if (built && pool >= bytes)
+				{
+					// Built, but already big enough - the early FiveM patch got
+					// there first. Nothing to do, and specifically nothing to
+					// clamp: the pool in front of us genuinely holds what was
+					// asked for.
+					logger::write("info",
+						"limits: replay heap is already %u MB - wide enough for %d+%d "
+						"blocks, keeping ReplayBlocks=%d",
+						pool / (1024u * 1024u), want, gsig::REPLAY_TEMP_BLOCKS, want);
+				}
+				else
+				{
+					cfg.replayBlocks = gsig::REPLAY_BLOCKS_SAFE_MAX;
+					logger::write("info",
+						"limits: cannot widen the replay heap (%s) - ReplayBlocks %d -> %d. "
+						"The %u MB pool holds %d blocks and no more.",
+						!sites ? "heap size sites unresolved"
+						       : built ? "heap already built - we installed too late"
+						               : "this process cannot reserve that much address space",
+						want, gsig::REPLAY_BLOCKS_SAFE_MAX,
+						pool / (1024u * 1024u), gsig::REPLAY_BLOCKS_SAFE_MAX);
+				}
+			}
+		}
+
+		// Is the replay heap already built?
+		//
+		// THE question for ever getting past 36. That ceiling is one 172 MB
+		// allocation made at rva 0x1020, and 36 is simply the largest block
+		// count that fits it - so the only way further is to widen that
+		// allocation, which can only be done BEFORE it happens.
+		//
+		// m_pReplayAllocator is null until the heap is built, so this one read
+		// decides whether that is even reachable from where we install.
+		if (game::addr_g_ReplayAllocator)
+		{
+			const void* alloc = *(void* const*)game::addr_g_ReplayAllocator;
+			logger::write("info",
+				"limits: replay heap %s at install (allocator=%p). %s",
+				alloc ? "ALREADY BUILT" : "not built yet", alloc,
+				alloc
+					? "Too late to resize it from here - the 172 MB pool is already "
+					  "committed, so 36 blocks is the ceiling for this injection point."
+					: "We are early enough to widen it - the pool has not been "
+					  "committed yet.");
+		}
+
+		// Backstop. The hook itself re-reads the ini on entry, so ReplayBlocks
+		// can be edited without a rebuild; at the stock 7 it is a pass-through.
+		if (game::addr_SetupReplayBuffer)
+			memory(game::addr_SetupReplayBuffer).hook(hkSetupReplayBuffer, &origSetupReplayBuffer);
+		else
+			logger::write("info",
+				"limits: SetupReplayBuffer unresolved - no backstop on the block count");
+
 		// Report what is ACTUALLY in effect, not what the ini asked for. These
 		// hooks are optional and simply do not resolve on a build we have no
 		// pattern for; echoing the config there claims a feature is on when the
@@ -296,6 +730,18 @@ namespace limits
 		// inlined, which is the case on Enhanced.
 		logger::write("info", "limits: distance=%s",
 			Config::get().unlimitedCameraDistance ? "unlimited (metadata)" : "stock");
+
+		// Deliberately says "pending": the hook it describes cannot be placed
+		// until a clip is open, so claiming it here would be reporting an
+		// intention as a fact. tick() logs the address once it really lands.
+		// TWO locks, reported separately. The menu one lands late (it needs an
+		// open clip); the director one is a plain hook. Lumping them together
+		// would report success when only half the job is done - which is exactly
+		// the state that produces a free camera that will not move.
+		logger::write("info", "limits: camera restrictions=%s, director gate=%s",
+			Config::get().unlockCameraRestrictions ? "unlocked (pending a clip)" : "stock",
+			!game::addr_IsPlaybackFlagSet          ? "stock (unresolved)"
+			: Config::get().unlockCameraRestrictions ? "lifted" : "stock");
 
 		// Report the two collision hooks SEPARATELY. Lumping them together said
 		// "stock (unresolved)" whenever ComputeSafePosition was missing, even
