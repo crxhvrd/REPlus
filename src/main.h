@@ -19,6 +19,7 @@
 #include "replay/smoothblend.h"
 #include "replay/settings.h"
 #include "replay/limits.h"
+#include "replay/scene.h"
 #include "ui/menu.h"
 
 inline const char* ExeName()

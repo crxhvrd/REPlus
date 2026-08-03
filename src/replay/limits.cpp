@@ -338,7 +338,7 @@ namespace limits
 			}
 
 			s_editableHooked = true;
-			memory((uintptr_t)fn).hook(hkIsEditable, &origIsEditable);
+			memory((uintptr_t)fn).hook(hkIsEditable, &origIsEditable, "IsMarkerControlEditable");
 			logger::write("info",
 				"limits: IsMarkerControlEditable hooked at %p (vtable +0x%X)",
 				fn, gsig::MARKERSTORAGE_VT_ISEDITABLE);
@@ -530,27 +530,27 @@ namespace limits
 		// Hooks are installed unconditionally so the in-editor menu can toggle
 		// them live; each one checks the config on entry.
 		if (game::addr_GetMaxDistanceFromPlayer)
-			memory(game::addr_GetMaxDistanceFromPlayer).hook(hkGetMaxDist, &origGetMaxDist);
+			memory(game::addr_GetMaxDistanceFromPlayer).hook(hkGetMaxDist, &origGetMaxDist, "GetMaxDistanceFromPlayer");
 		else
 			logger::write("info", "limits: distance getter unresolved — leash unchanged");
 
 		if (game::addr_UpdateCollision)
-			memory(game::addr_UpdateCollision).hook(hkUpdateCollision, &origUpdateCollision);
+			memory(game::addr_UpdateCollision).hook(hkUpdateCollision, &origUpdateCollision, "UpdateCollision");
 		else
 			logger::write("info", "limits: UpdateCollision unresolved — world collision unchanged");
 
 		if (game::addr_ComputeSafePosition)
-			memory(game::addr_ComputeSafePosition).hook(hkComputeSafePosition, &origComputeSafePos);
+			memory(game::addr_ComputeSafePosition).hook(hkComputeSafePosition, &origComputeSafePos, "ComputeSafePosition");
 		else
 			logger::write("info", "limits: ComputeSafePosition unresolved — attach collision unchanged");
 
 		if (game::addr_ProfanityGetStatus)
-			memory(game::addr_ProfanityGetStatus).hook(hkProfanityStatus, &origProfanityStatus);
+			memory(game::addr_ProfanityGetStatus).hook(hkProfanityStatus, &origProfanityStatus, "ProfanityGetStatus");
 		else
 			logger::write("info", "limits: profanity poll unresolved - filter unchanged");
 
 		if (game::addr_IsPlaybackFlagSet)
-			memory(game::addr_IsPlaybackFlagSet).hook(hkIsPlaybackFlagSet, &origIsPlaybackFlagSet);
+			memory(game::addr_IsPlaybackFlagSet).hook(hkIsPlaybackFlagSet, &origIsPlaybackFlagSet, "IsPlaybackFlagSet");
 		else
 			logger::write("info",
 				"limits: IsPlaybackFlagSet unresolved - a first-person clip keeps "
@@ -712,7 +712,7 @@ namespace limits
 		// Backstop. The hook itself re-reads the ini on entry, so ReplayBlocks
 		// can be edited without a rebuild; at the stock 7 it is a pass-through.
 		if (game::addr_SetupReplayBuffer)
-			memory(game::addr_SetupReplayBuffer).hook(hkSetupReplayBuffer, &origSetupReplayBuffer);
+			memory(game::addr_SetupReplayBuffer).hook(hkSetupReplayBuffer, &origSetupReplayBuffer, "SetupReplayBuffer");
 		else
 			logger::write("info",
 				"limits: SetupReplayBuffer unresolved - no backstop on the block count");

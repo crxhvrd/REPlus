@@ -148,6 +148,34 @@ UncapZoom=1                ; widen the stock 0.45x..4.50x range
 ZoomMinFov=1               ; 1..130 is the engine's own clamp
 ZoomMaxFov=130             ; readout is 45/fov: 1 = 45x in, 130 = 0.35x out
 
+; --- Scene: the clip's time of day and weather ------------------------------
+; A clip records the clock and the weather every frame and plays them back, so
+; neither can normally be changed. These substitute different values as the
+; frame is played. Nothing is written to the .clip - switch either off and the
+; clip is exactly as recorded again.
+; Both are also rows in the Rockstar Editor+ menu, under Scene.
+OverrideTimeOfDay=0        ; 1 = use TimeOfDay instead of the recorded clock
+TimeOfDay=720              ; minutes past midnight. 720 = 12:00, 1065 = 17:45
+
+OverrideWeather=0          ; 1 = use the four settings below
+; Index into weather.xml's load order:
+;   0 EXTRASUNNY  1 CLEAR   2 CLOUDS     3 SMOG     4 FOGGY
+;   5 OVERCAST    6 RAIN    7 THUNDER    8 CLEARING 9 NEUTRAL
+;  10 SNOW       11 BLIZZARD 12 SNOWLIGHT 13 XMAS   14 HALLOWEEN
+WeatherType=0
+WeatherBlendTo=-1          ; second type to blend towards, -1 = none
+WeatherBlend=0.0           ; 0..1 between WeatherType and WeatherBlendTo
+WeatherWetness=-1          ; 0..1 wet roads and puddles; -1 = as recorded
+
+; MASTER SWITCH for everything above. A clip also records the fully RESOLVED
+; timecycle keyframe every frame, which is why moving the clock on its own only
+; moves the sun - the sky, ambient and fog are baked in. 1 stands that down so
+; the timecycle is evaluated live from the new time and weather.
+; 0 keeps the clip's own lighting - which matters if the shot carried an
+; interior or mission grade - and switches the settings above OFF with it,
+; because a new time under recorded lighting is just an inconsistent sky.
+LiveTimecycle=1
+
 ; --- Recording length -------------------------------------------------------
 ; How long one clip can be, in 4 MB blocks. The ring IS the clip: it fills, the
 ; clip saves, and recording rolls into a new one - so length is ring size over

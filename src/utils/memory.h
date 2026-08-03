@@ -188,15 +188,35 @@ public:
 	}
 
 	template<class T>
-	void hook(T* target, T** orig = nullptr)
+	// Returns false if the detour is not actually in place.
+	//
+	// It used to return void and log a bare "MH_CreateHook failed 5" with no
+	// indication of WHICH hook, while every caller logged its own cheerful
+	// "hooked" line regardless. So a failed install and a working one produced
+	// the same log, and under FiveM - where the address space is crowded enough
+	// that MinHook can genuinely fail to place a trampoline within reach - there
+	// was no way to tell which feature had silently not been installed.
+	//
+	// `what` is optional so the existing call sites still compile; anything that
+	// passes it gets its name in the failure line.
+	bool hook(T* target, T** orig = nullptr, const char* what = nullptr)
 	{
-		auto status = MH_CreateHook((void*)address, (void*)target, (void**)orig);
+		const auto status = MH_CreateHook((void*)address, (void*)target, (void**)orig);
 		if (status != MH_OK)
-			logger::write("info", "MH_CreateHook failed %d", (int)status);
+		{
+			logger::write("info", "!! MH_CreateHook(%s @ %p) failed: %s (%d)",
+				what ? what : "?", (void*)address, MH_StatusToString(status), (int)status);
+			return false;
+		}
 
-		status = MH_EnableHook(MH_ALL_HOOKS);
-		if (status != MH_OK)
-			logger::write("info", "MH_EnableHook failed %d", (int)status);
+		const auto en = MH_EnableHook(MH_ALL_HOOKS);
+		if (en != MH_OK)
+		{
+			logger::write("info", "!! MH_EnableHook(%s @ %p) failed: %s (%d)",
+				what ? what : "?", (void*)address, MH_StatusToString(en), (int)en);
+			return false;
+		}
+		return true;
 	}
 
 	template<typename RetType, typename... Args>

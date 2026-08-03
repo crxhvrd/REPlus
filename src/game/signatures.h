@@ -1705,4 +1705,145 @@ namespace gsig
 
 	// `mov [rip+disp32],ecx` storing the type into ms_playbackType, at the end
 	// of the pattern above. The disp is relative to the END of the instruction.
+
+	// -------------------------------------------------------------------------
+	// CPacketWeather::Extract(this)   leg RVA 0x463464, enh RVA 0x1D96F50
+	//
+	// One address buys BOTH the weather and the time-of-day override, which is
+	// why this is the only signature the scene feature needs.
+	//
+	// Named from the "CPacketWeather" string the replay interface's constructor
+	// registers it under - the packet-descriptor table in both exes stores
+	// (size << 32) | id next to that string, which is where the 288 and the 6
+	// below come from.
+	//
+	// It has exactly ONE call site on either build, in the packet-dispatch
+	// preprocess pass:
+	//
+	//     mov  rax, [rcx+0x848]       ; bool* - the weather-override flag
+	//     cmp  byte [rax], 0
+	//     jnz  skip
+	//     mov  rcx, <the packet>
+	//     call CPacketWeather::Extract
+	//
+	// so it fires once per played frame with a pointer straight into the live
+	// replay buffer. The decompile shows it only ever READS from its packet -
+	// it hands the fields to the weather system and memcpy's the wind state out
+	// - so a patched stack copy can be substituted for it with nothing to
+	// restore, and every derived piece of state (clouds, wind, wetness, the snow
+	// VFX flags) is still set by the game's own code rather than by us.
+	//
+	// The frame's CPacketClock is exactly 20 bytes in front of the weather
+	// packet: the recorder emits GameTime, Clock and Weather back to back, which
+	// is visible in any clip - a packet walk over 3,193 frames across both
+	// builds found the clock immediately before the weather packet every time.
+	// scene.cpp validates it per frame rather than assuming it.
+	//
+	// Both patterns key on the same two things: the packet-version compare
+	// against a global at `this+7` (the version byte of the size/version word),
+	// and the pair of MOVSS loads at +0x114/+0x118 that the version guards.
+	// Those offsets are what makes this a weather packet and nothing else.
+	//
+	//   leg: 8A 05 ?? ?? ?? ??   mov al, [rip+d]   ; minimum packet version
+	//        38 41 07            cmp [rcx+7], al   ; the packet's version
+	//   enh: 0F B6 05 ?? ?? ?? ? movzx eax, byte [rip+d]
+	//        3A 41 07            cmp al, [rcx+7]   ; operands swapped, hence JA
+	// -------------------------------------------------------------------------
+	inline constexpr Sig PACKETWEATHER_EXTRACT = {
+		"56 48 83 EC 70 0F 29 74 24 60 48 89 CE 0F B6 05 ? ? ? ? "
+		"0F 57 C0 0F 57 C9 3A 41 07 77 10 "
+		"F3 0F 10 8E 14 01 00 00 F3 0F 10 86 18 01 00 00",
+		"48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 60 "
+		"8A 05 ? ? ? ? 0F 57 C0 48 8B D9 0F 28 C8 38 41 07 72 10 "
+		"F3 0F 10 81 14 01 00 00"
+	};
+
+	// The weather and clock packets, as they sit in the replay buffer.
+	//
+	// The common packet header is 12 bytes, not 8: retail clips are written with
+	// guards on, so every packet carries 0xAAAAAAAA right after the size word.
+	// That guard is what lets scene.cpp prove it is looking at the right packet
+	// instead of trusting arithmetic. All of this is visible in a .clip: the
+	// packets are stored uncompressed inside each block, and the chain walks
+	// cleanly from the first byte using nothing but the size field.
+	inline constexpr unsigned PACKET_GUARD_BASE   = 0xAAAAAAAA;
+	inline constexpr unsigned short PACKETID_CLOCK   = 5;
+	inline constexpr unsigned short PACKETID_WEATHER = 6;
+	inline constexpr unsigned short PACKETID_TIMECYCLE_MODIFIER = 317;
+	inline constexpr int PACKET_CLOCK_SIZE   = 20;
+	inline constexpr int PACKET_WEATHER_SIZE = 288;
+	inline constexpr int PACKET_GUARD_OFF    = 8;    // u32 == PACKET_GUARD_BASE
+	inline constexpr int PACKET_SIZE_OFF     = 4;    // u32, size:24 | version:8
+
+	// -------------------------------------------------------------------------
+	// The timecycle variable table   leg RVA 0x1E00160, enh RVA 0x293E7A0
+	//
+	// THE lever for re-lighting a clip, and it is data rather than code.
+	//
+	// A clip records the fully RESOLVED timecycle keyframe every frame - the
+	// ~416 lighting variables already evaluated for the hour and weather it was
+	// shot in - and the replay path copies that back over the live one. The
+	// copy is per-variable and gated on a flag in this table, which decompiles
+	// to roughly:
+	//
+	//     if (replayModeIsEdit)
+	//         for (i = 0; i < varCount; ++i)
+	//             if (table[i * 0x20 + 0x18])          // the per-var flag
+	//                 liveKeyframe[i] = recordedKeyframe[i];
+	//
+	// So the base timecycle IS evaluated from the live clock and weather every
+	// frame - and then thrown away, variable by variable. In the editor that
+	// outer test is unconditionally true, and it is inlined on both builds, so
+	// the flag is the only thing left to hold. Clear it and the freshly
+	// evaluated keyframe survives.
+	//
+	// Do NOT confuse this with stopping the packet that carries the recorded
+	// keyframe: neutering it leaves the recorded frame holding the PREVIOUS
+	// frame's values, and the loop above copies those over the live keyframe
+	// just the same. The result is frozen lighting that looks exactly like no
+	// change at all - confirmed in-game before this was traced to the flag.
+	//
+	// The same flag is read by the RECORDING path, which is why it has to be
+	// put back the moment the editor is left; otherwise clips recorded
+	// afterwards would carry no lighting at all.
+	//
+	// Retail entries are 32 bytes. Read out of the table itself, cross-checked
+	// against the stock values that ship in the game's own timecycle data:
+	//     +0x00 int   varId          (0,1,2,... - sequential, which is how the
+	//                                 end of the table is found without a count)
+	//     +0x08 char* name           ("light_dir_col_r", "light_dir_col_g", ...)
+	//     +0x10 float defaultValue
+	//     +0x14 int   varType
+	//     +0x18 bool  replay-override flag
+	//     +0x1C int   modifier type
+	//
+	// One pattern serves both builds: the table's literal bytes are identical
+	// and only the two name pointers differ. It keys on entry 0 and entry 1 -
+	// light_dir_col_r 0.890 and light_dir_col_g 0.675 - and matches exactly once
+	// per binary.
+	inline constexpr Sig TIMECYCLE_VARINFOS = {
+		"00 00 00 00 00 00 00 00 ? ? ? ? ? ? ? ? 0A D7 63 3F 04 00 00 00 "
+		"01 00 00 00 02 00 00 00 01 00 00 00 00 00 00 00 ? ? ? ? ? ? ? ? "
+		"CD CC 2C 3F 00 00 00 00 01 00 00 00 02 00 00 00",
+		"00 00 00 00 00 00 00 00 ? ? ? ? ? ? ? ? 0A D7 63 3F 04 00 00 00 "
+		"01 00 00 00 02 00 00 00 01 00 00 00 00 00 00 00 ? ? ? ? ? ? ? ? "
+		"CD CC 2C 3F 00 00 00 00 01 00 00 00 02 00 00 00"
+	};
+
+	inline constexpr int TCVARINFO_STRIDE      = 32;
+	inline constexpr int TCVARINFO_VARID_OFF   = 0x00;
+	inline constexpr int TCVARINFO_REPLAY_OFF  = 0x18;
+	// Sanity bound on the walk. The stock table is a little over 400 entries;
+	// anything past this means the sequential-varId test has stopped being a
+	// reliable end marker, so stop rather than keep writing.
+	inline constexpr int TCVARINFO_MAX         = 1024;
+
+	inline constexpr int CLOCK_HOURS_OFF   = 12;
+	inline constexpr int CLOCK_MINUTES_OFF = 13;
+	inline constexpr int CLOCK_SECONDS_OFF = 14;
+
+	inline constexpr int WEATHER_OLDTYPE_OFF = 0x0C;
+	inline constexpr int WEATHER_NEWTYPE_OFF = 0x10;
+	inline constexpr int WEATHER_INTERP_OFF  = 0x14;
+	inline constexpr int WEATHER_WETNESS_OFF = 0x20;
 }

@@ -40,6 +40,21 @@ namespace exporthook
 		// up yet, and the replay clock is not usable until it has.
 		bool s_pending = false;
 
+		// How many times Open has actually been intercepted. Zero after the user
+		// has pressed Export is the whole diagnosis: the pattern resolved to
+		// something, but not to the function the editor calls.
+		unsigned s_opens = 0;
+
+		// The first bytes at the target, sampled AFTER our detour is written.
+		//
+		// Another ASI that patches the same function with a raw jump - EVE/EVER
+		// install absolute jumps rather than trampolines - overwrites us with no
+		// error anywhere: MinHook reported success, our log says "hooked", and
+		// the detour is simply gone. That is invisible today and it is a real
+		// possibility on a machine running several export mods.
+		uint8_t  s_prologue[16]{};
+		bool     s_prologueSaved = false;
+
 		void __fastcall hkOpen(int type, unsigned arg)
 		{
 			// Report each playback type the first time it comes through.
@@ -52,14 +67,19 @@ namespace exporthook
 			// Deduplicated by type, so this is a handful of lines a session, not
 			// a per-open stream. type 0 = PREVIEW_FULL_PROJECT, 1 = BAKE.
 			{
-				static unsigned s_seen = 0;
-				if (type >= 0 && type < 32 && !(s_seen & (1u << type)))
-				{
-					s_seen |= (1u << type);
-					logger::write("info", "export: playback Open(type=%d, arg=%u)%s",
-						type, arg,
-						type == gsig::PLAYBACK_TYPE_BAKE ? "  <- this is Export/bake" : "");
-				}
+				// EVERY call, not the first per type.
+				//
+				// This used to deduplicate by type to keep the log short, and that
+				// cost a diagnosis: a user reported Export falling back to the
+				// vanilla encoder, and their log contained no Open line at all.
+				// With dedup in place "the hook never fired" and "it fired again
+				// on a type already seen" are the same absence, so there was no
+				// way to tell a bad pattern from a bad decision. Open is pressed
+				// by hand a few times a session - there is nothing to save here.
+				++s_opens;
+				logger::write("info", "export: playback Open(type=%d, arg=%u) [call %u]%s",
+					type, arg, s_opens,
+					type == gsig::PLAYBACK_TYPE_BAKE ? "  <- this is Export/bake" : "");
 			}
 
 			if (type == gsig::PLAYBACK_TYPE_BAKE &&
@@ -107,8 +127,16 @@ namespace exporthook
 		}
 	}
 
-	bool pending() { return s_pending; }
-	void clearPending() { s_pending = false; }
+	bool     pending()   { return s_pending; }
+	void     clearPending() { s_pending = false; }
+	unsigned openCount() { return s_opens; }
+
+	bool hookIntact()
+	{
+		if (!s_prologueSaved || !game::addr_PlaybackOpen) return false;
+		return memcmp(s_prologue, (const void*)game::addr_PlaybackOpen,
+		              sizeof(s_prologue)) == 0;
+	}
 
 	void install()
 	{
@@ -117,8 +145,19 @@ namespace exporthook
 			logger::write("info", "export: Playback::Open unresolved - Export stays stock");
 			return;
 		}
-		memory(game::addr_PlaybackOpen).hook(hkOpen, &origOpen);
-		logger::write("info", "export: hooked (RE+ renderer = %s)",
+		if (!memory(game::addr_PlaybackOpen).hook(hkOpen, &origOpen, "PlaybackOpen"))
+		{
+			logger::write("info",
+				"export: !! the Open hook did NOT install - Export will run the game's "
+				"own bake. Nothing below this line about RE+ rendering will happen.");
+			return;
+		}
+
+		memcpy(s_prologue, (const void*)game::addr_PlaybackOpen, sizeof(s_prologue));
+		s_prologueSaved = true;
+
+		logger::write("info", "export: hooked at %p (RE+ renderer = %s)",
+			(void*)game::addr_PlaybackOpen,
 			Config::get().enableRenderer ? "on" : "off");
 	}
 }

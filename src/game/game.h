@@ -110,6 +110,19 @@ namespace game
 	// re-derives them has to leave the early values alone.
 	extern bool replayHeapWidenedEarly;
 
+	// CPacketWeather::Extract(this). One call site per build, once per played
+	// frame, holding a pointer into the live replay buffer - which is both the
+	// weather override and (via the clock packet 20 bytes in front of it) the
+	// time-of-day one. Optional: unresolved just leaves the clip's own recorded
+	// time and weather alone.
+	extern uintptr_t addr_PacketWeatherExtract;
+
+	// The timecycle variable table. Its per-variable replay-override flag is
+	// what decides whether the clip's recorded lighting overwrites the freshly
+	// evaluated timecycle. Optional: unresolved just means the clip keeps its
+	// baked lighting when time or weather is overridden.
+	extern uintptr_t addr_g_TcVarInfos;
+
 	extern uintptr_t addr_SetCursorSpeed;        // CReplayMgrInternal::SetCursorSpeed(float)
 	extern uintptr_t addr_SetNextPlayBackState;  // CReplayMgrInternal::SetNextPlayBackState(u32)
 	extern uintptr_t addr_g_ReplayMode;          // int, CReplayMgr mode (2 = EDIT)

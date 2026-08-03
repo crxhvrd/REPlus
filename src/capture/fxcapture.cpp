@@ -14,6 +14,11 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <psapi.h>
+#include <shlwapi.h>
+#include <vector>
+#pragma comment(lib, "version.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 namespace fxcapture
 {
@@ -63,6 +68,110 @@ namespace fxcapture
 			GetModuleFileNameA(GetModuleHandleA(nullptr), out, (DWORD)cap);
 			if (char* slash = strrchr(out, '\\')) *slash = '\0';
 		}
+
+		// =====================================================================
+		//  Which ReShade is loaded, if any
+		// =====================================================================
+		//  "Export fell back to the vanilla encoder" has one overwhelmingly
+		//  common cause: the ORDINARY ReShade build, which cannot load add-ons
+		//  at all. The add-on is then never loaded, never presents, the
+		//  heartbeat stays zero and Export correctly declines to divert - and
+		//  nothing anywhere says why. It is in both READMEs and it still cost a
+		//  support round, because people install first and read later.
+		//
+		//  It is decidable, and by exactly the test ReShade's own add-on header
+		//  uses to find its host: walk the loaded modules for one exporting
+		//  ReShadeRegisterAddon / ReShadeUnregisterAddon. Those live inside
+		//  `#if RESHADE_ADDON`, so the standard build does not have them.
+		//
+		//  When that fails we still want to distinguish "no ReShade" from "the
+		//  wrong ReShade", so a second pass looks for a module whose version
+		//  resource names ReShade. Present without the exports IS the wrong
+		//  build, and that is the sentence worth printing.
+		// =====================================================================
+		bool moduleNamesReShade(HMODULE m)
+		{
+			char path[MAX_PATH]{};
+			if (!GetModuleFileNameA(m, path, MAX_PATH)) return false;
+
+			DWORD handle = 0;
+			const DWORD size = GetFileVersionInfoSizeA(path, &handle);
+			if (!size) return false;
+
+			std::vector<char> buf(size);
+			if (!GetFileVersionInfoA(path, handle, size, buf.data())) return false;
+
+			// Language-agnostic: walk whatever translation the file actually has
+			// rather than assuming 040904b0.
+			struct LangCp { WORD lang, cp; }* tr = nullptr;
+			UINT trLen = 0;
+			if (!VerQueryValueA(buf.data(), "\\VarFileInfo\\Translation",
+			                    (void**)&tr, &trLen) || trLen < sizeof(LangCp))
+				return false;
+
+			for (UINT i = 0; i < trLen / sizeof(LangCp); ++i)
+			{
+				for (const char* field : { "ProductName", "FileDescription" })
+				{
+					char q[128]{};
+					sprintf_s(q, "\\StringFileInfo\\%04x%04x\\%s",
+						tr[i].lang, tr[i].cp, field);
+					char* val = nullptr; UINT vlen = 0;
+					if (VerQueryValueA(buf.data(), q, (void**)&val, &vlen) && val)
+						if (StrStrIA(val, "ReShade")) return true;
+				}
+			}
+			return false;
+		}
+
+		void reportReShade()
+		{
+			HMODULE mods[1024]{};
+			DWORD   need = 0;
+			if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need))
+			{
+				logger::write("info", "capture: could not enumerate modules - "
+					"cannot tell which ReShade is loaded");
+				return;
+			}
+			const DWORD count = (need > sizeof(mods) ? sizeof(mods) : need) / sizeof(HMODULE);
+
+			HMODULE addonCapable = nullptr, looksLikeReShade = nullptr;
+			for (DWORD i = 0; i < count; ++i)
+			{
+				if (GetProcAddress(mods[i], "ReShadeRegisterAddon") &&
+				    GetProcAddress(mods[i], "ReShadeUnregisterAddon"))
+				{
+					addonCapable = mods[i];
+					break;
+				}
+				if (!looksLikeReShade && moduleNamesReShade(mods[i]))
+					looksLikeReShade = mods[i];
+			}
+
+			char path[MAX_PATH]{};
+			if (addonCapable)
+			{
+				GetModuleFileNameA(addonCapable, path, MAX_PATH);
+				logger::write("info", "capture: ReShade WITH add-on support -> %s", path);
+			}
+			else if (looksLikeReShade)
+			{
+				GetModuleFileNameA(looksLikeReShade, path, MAX_PATH);
+				logger::write("info",
+					"capture: !! ReShade is loaded (%s) but it is the ORDINARY build - it "
+					"cannot load add-ons at all, so IgcsConnector will never run and Export "
+					"will always fall back to the game's own encoder. Reinstall ReShade and "
+					"choose the version WITH full add-on support.", path);
+			}
+			else
+			{
+				logger::write("info",
+					"capture: no ReShade in this process. Rendering and depth of field need "
+					"ReShade WITH full add-on support; everything else works without it.");
+			}
+		}
+
 	}
 
 	void init()
@@ -99,6 +208,10 @@ namespace fxcapture
 		logger::write("info", "capture: channel mapped (%s), addon=%s",
 			existed ? "joined" : "created",
 			s_block->addonHeartbeat ? "present" : "not seen yet");
+
+		// Which ReShade, if any. The answer decides whether rendering can work
+		// at all, and it is knowable here rather than after a failed Export.
+		reportReShade();
 	}
 
 	bool available()    { return s_block != nullptr; }

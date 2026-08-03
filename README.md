@@ -3,14 +3,20 @@
 Camera and rendering mod for GTA V's Rockstar Editor. Legacy (`GTA5.exe`) and
 Enhanced (`GTA5_Enhanced.exe`), singleplayer and FiveM, one build.
 
+**1 — Camera and scene**
+
 - **Spline camera** — markers joined by a curve through every point instead of
   the stock straight line. Position, rotation and FOV. Attached markers curve in
   the parent entity's frame; look-at markers re-aim from the splined position.
 - **Procedural shake** — six-axis, per marker, in degrees and hertz.
   Deterministic: same clip, same output.
-- **Render pipeline** on the Export button — video or image sequence, arbitrary
-  frame rate, accumulated motion blur, project audio, no watermark. Renders every
-  clip in the project.
+- **Time of day and weather** — relight a clip at any hour, or replace the
+  weather it was shot in. A clip normally replays its own clock, weather *and*
+  lighting, so none of it can be changed; these are substituted as the frame
+  plays and nothing is written to the `.clip`.
+
+**2 — Limits removed**
+
 - **Longer recordings** — the clip length limit is a memory budget, not a timer,
   which is why a busy street gives you seconds where an empty road gives a
   minute. Lifting it takes ~17 seconds of dense city to **1m 45s**. On by
@@ -18,8 +24,16 @@ Enhanced (`GTA5_Enhanced.exe`), singleplayer and FiveM, one build.
 - **Free camera on first-person clips** — the editor normally greys out the whole
   Camera submenu on anything recorded in first person, leaving the clip stuck
   with the recorded view.
-- **Editor limits lifted** — camera distance, collision, profanity check,
-  timeline spinner, zoom range.
+- **The rest of the guard rails** — camera distance, collision, zoom range,
+  profanity check.
+
+**3 — Rendering**
+
+- **Render pipeline** on the Export button — video or image sequence, arbitrary
+  frame rate, accumulated motion blur, project audio, no watermark. Renders every
+  clip in the project.
+
+---
 
 ---
 
@@ -83,106 +97,24 @@ All settings are in the editor. Open a marker's menu and find the
 
 | Where | Behaviour |
 |---|---|
-| Top-level marker menu | pages through global settings: **Curve**, **Limits** |
+| Top-level marker menu | pages through global settings: **Curve**, **Limits**, **Scene** |
 | Camera submenu | group switcher: Spline, Shake, Shake Motion, 4 advanced pages |
 
-Two pages rather than one because the editor's Scaleform column draws 16 rows
-and silently discards the rest.
+Pages rather than one long list because the editor's Scaleform column draws 16
+rows and silently discards the rest.
 
 **Adjust Step** sets the increment for left/right, 0.001 to 1. Changes save
 automatically — global to the ini, per-marker to a side-car file.
 
 ---
 
-## Per-marker settings
+## 1 — Camera and scene
 
-A marker's curve, shake and per-axis values are stored beside the project rather
-than inside it, because the marker struct is serialised straight into the `.clip`
-file and has nowhere to put extra fields without breaking the format the game's
-own loader validates. Keeping them outside means a project still opens on a
-machine without this mod.
+How the shot moves and how it is lit: the curve between markers, the shake on
+top of it, and the time of day and weather it plays in. Everything here is
+authored per project — the mod's own settings, not the game's.
 
-They are scoped to the **project and clip** you set them in.
-`markers\<project>.txt` holds one project, with its clips as sections inside:
-
-```
-RockstarEditorPlus v6
-clip 0
-marker 7138 shake=1 intensity=1.35 freqMul=0.15
-marker 7968 shake=1 intensity=1.35
-clip 1
-marker 0 orient=2
-```
-
-Fields are named and only written when set, so the file stays readable and a
-lightly-edited marker is one short line. Plain text, safe to hand-edit if a
-project needs rescuing.
-
-> Scoping is by clip *index*, so reordering a project's clips carries the
-> settings with the slot rather than with the clip.
-
----
-
-## First-person clips
-
-Record anything from the first-person view and the editor greys out the whole
-Camera submenu — the clip keeps the recorded view forever.
-
-`UnlockCameraRestrictions=1` (default) removes it, and those clips take a free
-camera like any other.
-
-There are two locks, not one. The menu greys the row, and separately the camera
-director ignores whatever the marker asks for and forces the recorded camera —
-so unlocking only the menu gives you a free camera that will not move, because
-there is no free camera. Both are lifted.
-
-The same pair of locks covers clips recorded during a cutscene or with camera
-movement disabled, and those are lifted too. In practice you are unlikely to have
-such a clip: recording stops while controls are disabled, which is the same
-condition that flags them.
-
----
-
-## Recording length
-
-`ReplayBlocks` in `RockstarEditorPlus.ini`. The recording ring **is** the clip:
-it fills, the clip saves, and recording rolls straight into a new one — so
-length is ring size divided by how fast the scene fills it. That is why the
-number moves with traffic density rather than being a fixed duration.
-
-The game ships 30 blocks, and not by preference: its settings code force-clamps
-the count to 30 whenever the replay heap is under ~196 MB, and the heap is
-172 MB. The heap is widened first, so the clamp stops firing.
-
-Measured in dense city traffic:
-
-| | ring | clip |
-|---|---|---|
-| 30 *(the game's own)* | 120 MB | ~17 s |
-| 64 | 256 MB | ~44 s |
-| **128** *(default)* | 512 MB | **~1m 45s** |
-
-**It costs RAM.** Each block needs 4 MB plus a 384 KB thumbnail, so the default
-reserves about 604 MB for the session, and clips grow to match — a 128-block
-clip is roughly 230 MB on disk. That is the right trade for a tool whose whole
-job is capturing footage, but lower it if memory is tight. If you shoot long,
-check the editor's own disk allowance under Settings → Saving & Startup.
-
-Above 30 depends on the heap widening succeeding. If it cannot — the patterns
-did not resolve on your build, or the process cannot reserve that much address
-space — the value is clamped back to 30 and the log says which. Takes effect at
-the next recording, so restart before shooting.
-
-**Under FiveM this has to happen much earlier.** The pool is sized once at
-startup and can only be changed before that, and FiveM defers the mod's init to
-ScriptHookV — 20 to 90 seconds later, long after the pool is committed. So the
-widening runs at DLL attach instead, before anything else. Same result; the log
-reports it separately (`replay heap 172 -> 604 MB ... patched at attach`) so you
-can tell which path did the work.
-
----
-
-## Camera
+### Spline
 
 On by default; takes over markers set to **Smooth** blend.
 
@@ -221,9 +153,7 @@ With evenly spaced markers that never reverse, all three are indistinguishable.
 Per marker: override curve shape, add ease-in/ease-out, or force stock behaviour
 for one segment.
 
----
-
-## Shake
+### Shake
 
 Set a marker's stock **Shake** row to **Rockstar Editor+**.
 
@@ -253,9 +183,199 @@ marker in the project. Shake only; curve and easing are untouched.
 > Shake is a function of clip time, so it is frozen while the playhead is.
 > Play or scrub to judge it.
 
+### Time of day and weather
+
+**Rockstar Editor+ → Scene**, in the top-level marker menu. Ships off.
+
+A clip records the clock and the weather on every frame and replays them, which
+is why setting the time or forcing weather from a trainer does not survive a
+single frame in the editor. These rows substitute different values as the frame
+is played instead, so the change holds for the whole clip and shows up live.
+
+| Row | |
+|---|---|
+| **Timecycle** | the page's master switch. **Live** re-lights the clip for the settings below; **As Recorded** keeps the clip's own lighting and greys the rest out |
+| **Time of Day** | As Recorded, or any quarter hour. Relights the whole clip |
+| **Weather** | As Recorded, or one of the game's 15 types |
+| **Weather Blend To** | a second type to sit between |
+| **Weather Blend** | 0–1 between the two. This is the engine's own transition, so half-way is real weather rather than a cross-fade |
+| **Wetness** | wet roads and puddles, independent of the type. As Recorded is not the same as 0 — a clip shot in the rain has wet ground |
+
+Weather is handed to the game's own weather code rather than forced field by
+field, so clouds, wind, puddles and the snow effects all follow the type you
+pick.
+
+**Why the Timecycle row exists.** A clip does not just record the clock and the
+weather — it records the *fully resolved timecycle keyframe*, every lighting
+variable already evaluated for the hour and weather it was shot in. The engine
+still evaluates the timecycle live on every replayed frame, then throws it away
+variable by variable and puts the recorded one back. So on its own, moving the
+clock to midnight moves the sun and leaves an afternoon sky; switching to RAIN
+gives you rain particles over sunshine. **Live** stops that replacement, so the
+freshly evaluated lighting survives.
+
+The trade is that any timecycle *modifier* the clip carried goes with it — an
+interior grade, a mission colour grade, script post FX. Set the row to
+**As Recorded** to keep those and accept the baked lighting.
+
+That is why Timecycle is the master switch rather than one setting among six:
+with the recorded lighting standing, a new time of day would only swing the sun
+across an unchanged sky and a new weather would drop rain into sunshine. On
+**As Recorded** the other rows are greyed *and* inert — the clip plays exactly
+as shot, and what the rows say matches what playback does.
+
+> **Nothing is written to the `.clip`.** The substitution happens as the frame
+> is played, so the file on disk is untouched and a clip opened without the mod
+> is exactly as it was shot. That also means the look is a setting rather than
+> an edit: set a row back to *As Recorded* and it is gone.
+
+### Per-marker settings
+
+A marker's curve, shake and per-axis values are stored beside the project rather
+than inside it, because the marker struct is serialised straight into the `.clip`
+file and has nowhere to put extra fields without breaking the format the game's
+own loader validates. Keeping them outside means a project still opens on a
+machine without this mod.
+
+They are scoped to the **project and clip** you set them in.
+`markers\<project>.txt` holds one project, with its clips as sections inside:
+
+```
+RockstarEditorPlus v6
+clip 0
+marker 7138 shake=1 intensity=1.35 freqMul=0.15
+marker 7968 shake=1 intensity=1.35
+clip 1
+marker 0 orient=2
+```
+
+Fields are named and only written when set, so the file stays readable and a
+lightly-edited marker is one short line. Plain text, safe to hand-edit if a
+project needs rescuing.
+
+> Scoping is by clip *index*, so reordering a project's clips carries the
+> settings with the slot rather than with the clip.
+
 ---
 
-## Rendering
+## 2 — Limits removed
+
+The editor is built for clips, not for shots, and most of what stops you is a
+guard rail rather than a technical bound. Each of these is lifted independently
+and each is a single ini key, so any of them can go back to stock on its own.
+
+Every one resolves separately too: if a pattern does not match on your build the
+mod disables **that** limit and says so in the log, keeping the rest.
+
+### Recording length
+
+`ReplayBlocks` in `RockstarEditorPlus.ini`. The recording ring **is** the clip:
+it fills, the clip saves, and recording rolls straight into a new one — so
+length is ring size divided by how fast the scene fills it. That is why the
+number moves with traffic density rather than being a fixed duration.
+
+The game ships 30 blocks, and not by preference: its settings code force-clamps
+the count to 30 whenever the replay heap is under ~196 MB, and the heap is
+172 MB. The heap is widened first, so the clamp stops firing.
+
+Measured in dense city traffic:
+
+| | ring | clip |
+|---|---|---|
+| 30 *(the game's own)* | 120 MB | ~17 s |
+| 64 | 256 MB | ~44 s |
+| **128** *(default)* | 512 MB | **~1m 45s** |
+
+**It costs RAM.** Each block needs 4 MB plus a 384 KB thumbnail, so the default
+reserves about 604 MB for the session, and clips grow to match — a 128-block
+clip is roughly 230 MB on disk. That is the right trade for a tool whose whole
+job is capturing footage, but lower it if memory is tight. If you shoot long,
+check the editor's own disk allowance under Settings → Saving & Startup.
+
+Above 30 depends on the heap widening succeeding. If it cannot — the patterns
+did not resolve on your build, or the process cannot reserve that much address
+space — the value is clamped back to 30 and the log says which. Takes effect at
+the next recording, so restart before shooting.
+
+**Under FiveM this has to happen much earlier.** The pool is sized once at
+startup and can only be changed before that, and FiveM defers the mod's init to
+ScriptHookV — 20 to 90 seconds later, long after the pool is committed. So the
+widening runs at DLL attach instead, before anything else. Same result; the log
+reports it separately (`replay heap 172 -> 604 MB ... patched at attach`) so you
+can tell which path did the work.
+
+### First-person clips
+
+Record anything from the first-person view and the editor greys out the whole
+Camera submenu — the clip keeps the recorded view forever.
+
+`UnlockCameraRestrictions=1` (default) removes it, and those clips take a free
+camera like any other.
+
+There are two locks, not one. The menu greys the row, and separately the camera
+director ignores whatever the marker asks for and forces the recorded camera —
+so unlocking only the menu gives you a free camera that will not move, because
+there is no free camera. Both are lifted.
+
+The same pair of locks covers clips recorded during a cutscene or with camera
+movement disabled, and those are lifted too. In practice you are unlikely to have
+such a clip: recording stops while controls are disabled, which is the same
+condition that flags them.
+
+
+### Camera distance
+
+`UnlimitedCameraDistance=1` (default), `MaxCameraDistance=20000`.
+
+Stock leashes the free camera to **30 m** from the player and yanks it back —
+the same value feeds the out-of-range warning and the fallback to the recorded
+camera, so lifting it once covers all three.
+
+The world still streams around the *player*, not the camera, so expect LOD to
+drop off at distance. That is the trade, and it is why the leash exists.
+
+### Camera collision
+
+`DisableCameraCollision=1` (default).
+
+Stock pushes the camera off geometry. Pushing through a doorframe, a windscreen
+or a fence is most of what a cinematic move is, and the push-off does not just
+block those — it silently bends the path away from the markers you placed, so
+the mod would be fighting its own spline.
+
+The cost is that you can end up inside solid map with no visual reference. That
+is recoverable in a frame; a shot the push-off quietly ruined is not obvious at
+all.
+
+### Zoom range
+
+`UncapZoom=1` (default), `ZoomMinFov=1`, `ZoomMaxFov=130`.
+
+Stock allows a 10x span, 0.45x to 4.50x. That is a gameplay-camera choice, and
+this is not a gameplay camera — a long lens is ordinary cinematography and the
+range is the first thing anyone runs into.
+
+The ends default to the engine's own clamp, 1° to 130° of FOV, so nothing
+outside them was ever reachable. The editor's readout is `45 / fov`: 1° reads as
+45x in, 130° as 0.35x out.
+
+### Profanity check
+
+`BypassProfanityFilter=1` (default).
+
+Naming or exporting a project polls Social Club, and the poll times out to a
+refusal when it cannot be reached — so offline you cannot name a project at all,
+which is a network check standing between you and a local file.
+
+---
+
+## 3 — Rendering
+
+A complete replacement for the editor's own export, driven from the same button:
+arbitrary frame rate, true accumulated motion blur, project audio, no watermark,
+every clip in the project.
+
+### The renderer
 
 Triggered by **Export**. Nothing else starts it.
 
@@ -289,9 +409,7 @@ Alternatively point `AudioFromFile` at a stock export of the same project.
 **Duration** — rendering seeks frame by frame and is far slower than real time.
 Progress and an estimate go to the log every 15 seconds.
 
----
-
-## Capture modes
+### Capture modes
 
 `RenderCaptureMode` in `Render.ini`. Both average `RenderSamples` real renders
 into every output frame — the difference is what the world does between them.
@@ -321,9 +439,7 @@ The playback speed sliding uses is measured, not configured: it times one frame
 during a warm-up and solves for the speed that makes N samples span the shutter,
 then holds it. The log reports what it settled on.
 
----
-
-## Depth of field
+### Depth of field
 
 The capture add-on can walk the camera around a lens aperture and blend the
 result — real optical bokeh rather than a screen-space approximation.
@@ -375,6 +491,14 @@ Both files live in `RockstarEditorPlus\`, beside the `.asi`.
 | `UncapZoom` | 1 | widen the 0.45x–4.50x range to the engine's own 1–130° |
 | `ReplayBlocks` | 128 | recording length, in 4 MB blocks. 3–128 |
 | `UnlockCameraRestrictions` | 1 | free camera on first-person clips |
+| `OverrideTimeOfDay` | 0 | relight the clip at `TimeOfDay` instead of its recorded clock |
+| `TimeOfDay` | 720 | minutes past midnight. 720 = 12:00 |
+| `OverrideWeather` | 0 | replace the clip's recorded weather |
+| `WeatherType` | 0 | index into weather.xml's order. 0 EXTRASUNNY … 7 THUNDER … |
+| `WeatherBlendTo` | -1 | second type to blend towards; -1 = none |
+| `WeatherBlend` | 0.0 | 0–1 between the two types |
+| `WeatherWetness` | -1 | 0–1 wet roads and puddles; -1 = as recorded |
+| `LiveTimecycle` | 1 | re-light for the overridden time/weather instead of replaying the clip's baked keyframe |
 | `ShakeDebugLog` `SplineDebugLog` `SplineTraceLog` | 0 | diagnostics |
 
 ### `Render.ini`

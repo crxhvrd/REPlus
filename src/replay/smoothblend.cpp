@@ -1480,7 +1480,7 @@ namespace smoothblend
 			return;
 		}
 
-		memory(game::addr_UpdateSmoothing).hook(hkUpdateSmoothing, &origUpdateSmoothing);
+		memory(game::addr_UpdateSmoothing).hook(hkUpdateSmoothing, &origUpdateSmoothing, "UpdateSmoothing");
 
 		const Config& c = Config::get();
 		logger::write("info",

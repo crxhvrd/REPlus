@@ -162,7 +162,11 @@ namespace menu
 		// eight of ours is seventeen, and the seventeenth (Zoom Limit) was
 		// simply never drawn. Splitting the block is the only fix that keeps
 		// every row reachable AND leaves headroom for the next one.
-		enum { PAGE_CLOSED = 0, PAGE_CURVE, PAGE_LIMITS, PAGE_COUNT };
+		// PAGE_SCENE is the clip's time of day and weather - see scene.cpp. It
+		// is a page of its own rather than rows bolted onto Limits because it
+		// is the one group here that changes what the shot LOOKS like rather
+		// than what the camera is allowed to do.
+		enum { PAGE_CLOSED = 0, PAGE_CURVE, PAGE_LIMITS, PAGE_SCENE, PAGE_COUNT };
 		int  g_page         = PAGE_CLOSED;
 		bool g_stockShakeSet = false; // marker has a GAME shake, so the camera
 		                              // menu will also draw intensity + speed
@@ -194,6 +198,11 @@ namespace menu
 			ROW_G_HEADER,
 			ROW_COLLISION, ROW_DISTANCE, ROW_ZOOM,
 			ROW_G_PATH, ROW_G_ROT, ROW_G_FOV, ROW_G_ALPHA, ROW_G_PROFILE,
+			// Scene page. These do not touch the .clip - they substitute values
+			// as the frame is played, so they are live and they are undone the
+			// moment the row goes back to "As Recorded".
+			ROW_S_TIME, ROW_S_WEATHER, ROW_S_BLENDTO, ROW_S_BLEND, ROW_S_WETNESS,
+			ROW_S_TIMECYCLE,
 			// An ACTION row, not a value row: accept performs it, left/right do
 			// nothing. It appears in every shake group because that is where you
 			// are standing when you decide the take needs it everywhere, and
@@ -266,8 +275,21 @@ namespace menu
 		inline bool isNumeric(int row) { return row >= ROW_NUM_FIRST; }
 		inline bool isGlobalRow(int row)
 		{
-			return row >= ROW_COLLISION && row <= ROW_G_PROFILE;
+			return row >= ROW_COLLISION && row <= ROW_S_TIMECYCLE;
 		}
+
+		inline bool isSceneRow(int row)
+		{
+			return row >= ROW_S_TIME && row <= ROW_S_TIMECYCLE;
+		}
+
+		// Time of day steps in quarter hours: 96 positions, plus "As Recorded".
+		// Fine enough to find golden hour, coarse enough to cross a whole day
+		// in one held press.
+		constexpr int kTimeStepMinutes = 15;
+		constexpr int kTimeSlots = (24 * 60) / kTimeStepMinutes;   // 96
+		// Wetness steps in twentieths, plus "As Recorded" at the bottom.
+		constexpr int kWetSlots = 21;
 
 		// An ACTION row: accept performs it, and there is no value to show.
 		// Drawn with ADD_COLUMN_ITEM, exactly like the stock "Edit Camera" row,
@@ -390,11 +412,24 @@ namespace menu
 					s_rows[s_shown++] = ROW_G_ALPHA;
 					s_rows[s_shown++] = ROW_G_PROFILE;
 				}
-				else
+				else if (g_page == PAGE_LIMITS)
 				{
 					s_rows[s_shown++] = ROW_COLLISION;
 					s_rows[s_shown++] = ROW_DISTANCE;
 					s_rows[s_shown++] = ROW_ZOOM;
+				}
+				else
+				{
+					// Timecycle first: it is the master switch, and every row
+					// under it greys out when it is on As Recorded. At the
+					// bottom you would walk past five dead rows to reach the
+					// one that brings them back.
+					s_rows[s_shown++] = ROW_S_TIMECYCLE;
+					s_rows[s_shown++] = ROW_S_TIME;
+					s_rows[s_shown++] = ROW_S_WEATHER;
+					s_rows[s_shown++] = ROW_S_BLENDTO;
+					s_rows[s_shown++] = ROW_S_BLEND;
+					s_rows[s_shown++] = ROW_S_WETNESS;
 				}
 				return;
 			}
@@ -498,6 +533,12 @@ namespace menu
 			case ROW_G_ALPHA:   return "Curve Shape";
 			case ROW_G_PROFILE: return "Speed Profile";
 			case ROW_G_HEADER:  return "Rockstar Editor+";
+			case ROW_S_TIME:    return "Time of Day";
+			case ROW_S_WEATHER: return "Weather";
+			case ROW_S_BLENDTO: return "Weather Blend To";
+			case ROW_S_BLEND:   return "Weather Blend";
+			case ROW_S_WETNESS: return "Wetness";
+			case ROW_S_TIMECYCLE: return "Timecycle";
 			case ROW_APPLY_ALL: return "Apply Shake to All";
 			case ROW_SHAKE_MODE: return "Shake Mode";
 			case ROW_INTENSITY:  return "Shake Amplitude";
@@ -579,6 +620,7 @@ namespace menu
 			if (row == ROW_G_HEADER)
 				return g_page == PAGE_CURVE  ? "Curve"
 				     : g_page == PAGE_LIMITS ? "Limits"
+				     : g_page == PAGE_SCENE  ? "Scene"
 				                             : "Closed";
 			if (row == ROW_G_PATH)
 				return (Config::get().splinePosition ? "On" : "Off");
@@ -595,6 +637,44 @@ namespace menu
 				     : c.smoothSpeedProfile ? "Continuous"
 				                            : "Per Segment";
 			}
+
+			// --- scene rows ---
+			// "As Recorded" rather than "Off" throughout: off would suggest the
+			// clip has no time or weather, when what is really happening is that
+			// its own recorded one is being left alone.
+			if (row == ROW_S_TIME)
+			{
+				const Config& c = Config::get();
+				if (!c.overrideTimeOfDay) return "As Recorded";
+				sprintf_s(buf, "%02d:%02d", c.timeOfDay / 60, c.timeOfDay % 60);
+				return buf;
+			}
+			if (row == ROW_S_WEATHER)
+			{
+				const Config& c = Config::get();
+				if (!c.overrideWeather) return "As Recorded";
+				return scene::weatherTypeName(c.weatherType);
+			}
+			if (row == ROW_S_BLENDTO)
+			{
+				const Config& c = Config::get();
+				if (c.weatherBlendTo < 0) return "None";
+				return scene::weatherTypeName(c.weatherBlendTo);
+			}
+			if (row == ROW_S_BLEND)
+			{
+				sprintf_s(buf, "%.2f", Config::get().weatherBlend);
+				return buf;
+			}
+			if (row == ROW_S_WETNESS)
+			{
+				const Config& c = Config::get();
+				if (c.weatherWetness < 0.0f) return "As Recorded";
+				sprintf_s(buf, "%.2f", c.weatherWetness);
+				return buf;
+			}
+			if (row == ROW_S_TIMECYCLE)
+				return Config::get().liveTimecycle ? "Live" : "As Recorded";
 
 			const Num* n = numFor(row);
 			if (!n) return "";
@@ -623,9 +703,16 @@ namespace menu
 			case ROW_G_FOV:
 			case ROW_SHAKE_MODE:
 			case ROW_STOP_STILL: return 2;
-			case ROW_G_ALPHA:
+			case ROW_G_ALPHA:   return 3;
 			case ROW_G_HEADER:  return PAGE_COUNT;
 			case ROW_G_PROFILE: return 3;
+			// +1 for the "As Recorded" / "None" slot each of these carries.
+			case ROW_S_TIME:    return kTimeSlots + 1;
+			case ROW_S_WEATHER: return scene::weatherTypeCount() + 1;
+			case ROW_S_BLENDTO: return scene::weatherTypeCount() + 1;
+			case ROW_S_BLEND:   return 21;
+			case ROW_S_WETNESS: return kWetSlots + 1;
+			case ROW_S_TIMECYCLE: return 2;
 			default: return -1;
 			}
 		}
@@ -734,7 +821,7 @@ namespace menu
 			// --- global rows, top-level marker menu ---
 			case ROW_G_HEADER:
 				return "Rockstar Editor+ settings for the whole session. Accept pages "
-				       "through Curve and Limits.";
+				       "through Curve, Limits and Scene.";
 			case ROW_G_PATH:  return "Replace the marker-to-marker camera PATH with a curve.";
 			case ROW_G_ROT:   return "Replace the marker-to-marker camera ROTATION with a curve.";
 			case ROW_G_FOV:   return "Replace the marker-to-marker ZOOM blend with a curve.";
@@ -747,6 +834,54 @@ namespace menu
 			case ROW_G_PROFILE:
 				return "Natural paces the shot from the marker times. Continuous fits one "
 				       "speed curve across all markers. Per Segment paces each on its own.";
+
+			// --- scene rows ---
+			// Every one of these says what happens to the .clip, because
+			// "changing the weather of a recording" sounds destructive and is
+			// not: nothing is written until you run the offline tool.
+			// The four value rows share one reason for being unavailable, so
+			// they share one line for it. It names the row that unlocks them
+			// rather than just saying no.
+			case ROW_S_TIME:
+			case ROW_S_WEATHER:
+			case ROW_S_BLENDTO:
+			case ROW_S_BLEND:
+			case ROW_S_WETNESS:
+				if (!scene::ready())
+					return "Unavailable: the weather packet hook did not resolve on this "
+					       "game build, so the clip plays exactly as recorded.";
+				if (!scene::overridesActive())
+					return "Set Timecycle to Live first. On As Recorded the clip keeps "
+					       "its own lighting, so a new time or weather could only move "
+					       "the sun across an unchanged sky.";
+				if (row == ROW_S_TIME)
+					return "Relight the clip at another time of day. Steps in 15 "
+					       "minutes. The .clip file is not changed.";
+				if (row == ROW_S_WEATHER)
+					return "Replace the weather the clip recorded. Sky, clouds, wind "
+					       "and puddles follow. The .clip file is not changed.";
+				if (row == ROW_S_WETNESS)
+					return "Wet roads and puddles, independent of the weather type. As "
+					       "Recorded keeps the clip's own, which is not the same as 0.";
+				if (!c.overrideWeather)
+					return "Set Weather to something other than As Recorded first.";
+				if (row == ROW_S_BLENDTO)
+					return "A second weather type to sit between. This is the game's own "
+					       "transition, so half-way states are real weather, not a fade.";
+				if (c.weatherBlendTo < 0)
+					return "Nothing to blend towards yet - set Weather Blend To first.";
+				return "How far between the two weather types. 0 is the first, 1 is the "
+				       "second.";
+
+			case ROW_S_TIMECYCLE:
+				if (!scene::canRelight())
+					return "Unavailable: the timecycle variable table did not resolve on "
+					       "this game build, so the clip's baked lighting cannot be "
+					       "stood down and nothing on this page would be consistent.";
+				return "Live re-lights the clip for the time and weather set below. As "
+				       "Recorded keeps the clip's own lighting and switches the rest of "
+				       "this page off - use it if the shot had an interior or mission "
+				       "colour grade.";
 			case ROW_COLLISION:
 				return "Off lets the camera pass through geometry, which also stops the "
 				       "push-off bending the path away from your markers.";
@@ -787,6 +922,30 @@ namespace menu
 			// value still moves and the camera does not, which is exactly the
 			// sort of question this field exists to answer.
 			if ((row == ROW_TENSION || row == ROW_G_ALPHA) && Config::get().naturalPacing)
+				return kOurRestriction;
+
+			// The scene rows are all one hook. Without it they would move and do
+			// nothing, which is the worst of the three possible behaviours.
+			if (isSceneRow(row) && !scene::ready())
+				return kOurRestriction;
+
+			// Timecycle is the master switch for the page, so it is the one row
+			// here that stays live whatever else is set - greying it as well
+			// would leave the page with no way back out.
+			if (row == ROW_S_TIMECYCLE && !scene::canRelight())
+				return kOurRestriction;
+
+			// Everything else is inert on "As Recorded": with the clip's baked
+			// lighting standing, a new time would only swing the sun across an
+			// unchanged sky and a new weather would drop particles into it.
+			if (row != ROW_S_TIMECYCLE && isSceneRow(row) && !scene::overridesActive())
+				return kOurRestriction;
+
+			// Blend needs somewhere to blend TO, and the weather rows need the
+			// override to be on at all.
+			if ((row == ROW_S_BLENDTO || row == ROW_S_BLEND) && !Config::get().overrideWeather)
+				return kOurRestriction;
+			if (row == ROW_S_BLEND && Config::get().weatherBlendTo < 0)
 				return kOurRestriction;
 
 			return gsig::EDIT_RESTRICTION_NONE;
@@ -865,11 +1024,89 @@ namespace menu
 			}
 
 			// --- global rows. Session settings, so they persist like the rest ---
+			// --- scene rows -------------------------------------------------
+			// Each of these steps a single list that has "As Recorded" (or
+			// "None") at position 0, so stepping left off the first real value
+			// hands the clip back rather than needing a separate toggle row.
+			if (row == ROW_S_TIME)
+			{
+				Config& c = Config::get();
+				const int cur = c.overrideTimeOfDay
+					? 1 + (c.timeOfDay / kTimeStepMinutes) : 0;
+				int next = cur + delta;
+				if (next < 0) next = 0;
+				if (next > kTimeSlots) next = kTimeSlots;
+
+				c.overrideTimeOfDay = next > 0;
+				if (next > 0) c.timeOfDay = (next - 1) * kTimeStepMinutes;
+				c.writeBool("OverrideTimeOfDay", c.overrideTimeOfDay);
+				c.writeInt("TimeOfDay", c.timeOfDay);
+				return;
+			}
+			if (row == ROW_S_WEATHER)
+			{
+				Config& c = Config::get();
+				const int count = scene::weatherTypeCount();
+				const int cur = c.overrideWeather ? 1 + c.weatherType : 0;
+				int next = cur + delta;
+				if (next < 0) next = 0;
+				if (next > count) next = count;
+
+				c.overrideWeather = next > 0;
+				if (next > 0) c.weatherType = next - 1;
+				c.writeBool("OverrideWeather", c.overrideWeather);
+				c.writeInt("WeatherType", c.weatherType);
+				return;
+			}
+			if (row == ROW_S_BLENDTO)
+			{
+				Config& c = Config::get();
+				const int count = scene::weatherTypeCount();
+				int next = (c.weatherBlendTo < 0 ? 0 : 1 + c.weatherBlendTo) + delta;
+				if (next < 0) next = 0;
+				if (next > count) next = count;
+
+				c.weatherBlendTo = next > 0 ? next - 1 : -1;
+				c.writeInt("WeatherBlendTo", c.weatherBlendTo);
+				return;
+			}
+			if (row == ROW_S_BLEND)
+			{
+				Config& c = Config::get();
+				float v = c.weatherBlend + 0.05f * delta;
+				if (v < 0.0f) v = 0.0f;
+				if (v > 1.0f) v = 1.0f;
+				c.weatherBlend = v;
+				c.writeFloat("WeatherBlend", v);
+				return;
+			}
+			if (row == ROW_S_WETNESS)
+			{
+				Config& c = Config::get();
+				// Slot 0 is "As Recorded"; 1..21 are 0.00 .. 1.00.
+				const int cur = c.weatherWetness < 0.0f
+					? 0 : 1 + (int)(c.weatherWetness * 20.0f + 0.5f);
+				int next = cur + delta;
+				if (next < 0) next = 0;
+				if (next > kWetSlots) next = kWetSlots;
+
+				c.weatherWetness = next > 0 ? (next - 1) * 0.05f : -1.0f;
+				c.writeFloat("WeatherWetness", c.weatherWetness);
+				return;
+			}
+			if (row == ROW_S_TIMECYCLE)
+			{
+				Config& c = Config::get();
+				c.liveTimecycle = delta > 0;
+				c.writeBool("LiveTimecycle", c.liveTimecycle);
+				return;
+			}
+
 			if (row == ROW_G_HEADER)
 			{
-				// Steps Closed -> Curve -> Limits -> Closed, in whichever
-				// direction you poke it. Accept advances the same way - see
-				// hkMenuInput.
+				// Steps Closed -> Curve -> Limits -> Scene -> Closed, in
+				// whichever direction you poke it. Accept advances the same way
+				// - see hkMenuInput.
 				g_page = (g_page + (delta > 0 ? 1 : PAGE_COUNT - 1)) % PAGE_COUNT;
 				Config::get().writeInt("MenuExpanded", g_page);
 				return;
@@ -1399,13 +1636,26 @@ namespace menu
 		{
 			return row == ROW_GROUP        // switches the whole group
 			    || row == ROW_G_HEADER     // pages the global block
-			    || row == ROW_G_PROFILE;   // decides whether Curve Shape is greyed
+			    || row == ROW_G_PROFILE    // decides whether Curve Shape is greyed
+			    // All three decide whether a row BELOW them is greyed, and a
+			    // restriction is baked into the ADD_COLUMN_ITEM call rather than
+			    // being re-read, so refreshing one row cannot update another's.
+			    || row == ROW_S_TIMECYCLE   // the Scene page's master switch
+			    || row == ROW_S_WEATHER
+			    || row == ROW_S_BLENDTO;
 		}
 
 		// `b` is pointer-sized so Enhanced's context pointer survives the
 		// pass-through untouched - see FnBeginMethod.
 		char __fastcall hkBeginMethod(int movie, int cls, const char* method, int a, void* b)
 		{
+			// Borrowing this hook as a general heartbeat, because it is the only
+			// one the mod owns that runs in ordinary gameplay as well as in the
+			// editor - and scene's timecycle flags MUST be put back when the
+			// editor is left, or clips recorded afterwards lose their lighting.
+			// One compare in the common case.
+			scene::tick();
+
 			// Cheap gate first: this runs for every Scaleform call in the game.
 			if (g_inCamMenu && !g_injecting && method)
 			{
@@ -1687,14 +1937,14 @@ namespace menu
 		g_page = Config::get().menuExpanded;
 		if (g_page < 0 || g_page >= PAGE_COUNT) g_page = PAGE_CLOSED;
 
-		memory(game::addr_PopulateCameraMenu).hook(hkPopulate,    &origPopulate);
-		memory(game::addr_BeginMethod).hook(hkBeginMethod, &origBeginMethod);
+		memory(game::addr_PopulateCameraMenu).hook(hkPopulate, &origPopulate, "PopulateCameraMenu");
+		memory(game::addr_BeginMethod).hook(hkBeginMethod, &origBeginMethod, "BeginMethod");
 		memory(game::addr_MenuInput).hook(hkMenuInput,   &origMenuInput);
 
 		// Optional: without it we simply lose the global rows. The camera
 		// submenu does not depend on this one resolving.
 		if (game::addr_PopulateMarkerMenu)
-			memory(game::addr_PopulateMarkerMenu).hook(hkPopulateMarker, &origPopulateMarker);
+			memory(game::addr_PopulateMarkerMenu).hook(hkPopulateMarker, &origPopulateMarker, "PopulateMarkerMenu");
 
 		// Optional: without it our rows keep the blank help line they had
 		// before, and rowRestriction() stops greying anything - see the note

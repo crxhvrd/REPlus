@@ -17,5 +17,15 @@ namespace exporthook
 	// renderer polls this from its per-frame pump, because playback is not
 	// usable at the moment Open is called.
 	bool pending();
+
+	// Times CVideoEditorPlayback::Open has been intercepted this session.
+	// Reported in the readiness line so that "Export did nothing" can be told
+	// apart from "Export was diverted and the render failed later".
+	unsigned openCount();
+
+	// False when our detour is no longer the code at the hook site - i.e.
+	// something patched over us after we installed. Compares the bytes we left
+	// there against what is there now.
+	bool hookIntact();
 	void clearPending();
 }

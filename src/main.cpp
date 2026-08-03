@@ -28,6 +28,7 @@ static void InstallResolved()
 	smoothblend::install();
 	menu::install();
 	limits::install();
+	scene::install();
 	exporthook::install();
 }
 

@@ -807,7 +807,7 @@ namespace render
 	{
 		if (game::addr_RenderSpinner)
 		{
-			memory(game::addr_RenderSpinner).hook(hkSpinner, &origSpinner);
+			memory(game::addr_RenderSpinner).hook(hkSpinner, &origSpinner, "RenderSpinner");
 			logger::write("info", "render: spinner suppression hooked");
 		}
 		else
@@ -817,7 +817,7 @@ namespace render
 
 		if (game::addr_DrawSpinner)
 		{
-			memory(game::addr_DrawSpinner).hook(hkDrawSpinner, &origDrawSpinner);
+			memory(game::addr_DrawSpinner).hook(hkDrawSpinner, &origDrawSpinner, "DrawSpinner");
 			logger::write("info", "render: spinner draw suppressed (the inlined-past one)");
 		}
 		else
@@ -828,7 +828,7 @@ namespace render
 
 		if (game::addr_ScaleformRenderMovie)
 		{
-			memory(game::addr_ScaleformRenderMovie).hook(hkRenderMovie, &origRenderMovie);
+			memory(game::addr_ScaleformRenderMovie).hook(hkRenderMovie, &origRenderMovie, "ScaleformRenderMovie");
 			logger::write("info", "render: scaleform movie rendering suppressed during capture");
 		}
 		else
@@ -839,7 +839,7 @@ namespace render
 
 		if (game::addr_BusySpinnerOn)
 		{
-			memory(game::addr_BusySpinnerOn).hook(hkSpinnerOn, &origSpinnerOn);
+			memory(game::addr_BusySpinnerOn).hook(hkSpinnerOn, &origSpinnerOn, "BusySpinnerOn");
 			logger::write("info", "render: editor seek spinner suppressed at source");
 		}
 		else
@@ -850,7 +850,7 @@ namespace render
 
 		if (game::addr_BusySpinnerRender)
 		{
-			memory(game::addr_BusySpinnerRender).hook(hkBusySpinner, &origBusySpinner);
+			memory(game::addr_BusySpinnerRender).hook(hkBusySpinner, &origBusySpinner, "BusySpinnerRender");
 			logger::write("info", "render: busy spinner suppression hooked");
 		}
 		else
@@ -860,7 +860,7 @@ namespace render
 
 		if (game::addr_MousePointerUpdate && game::addr_g_CursorVisible)
 		{
-			memory(game::addr_MousePointerUpdate).hook(hkPointer, &origPointer);
+			memory(game::addr_MousePointerUpdate).hook(hkPointer, &origPointer, "MousePointerUpdate");
 			logger::write("info", "render: cursor suppression hooked");
 		}
 		else
@@ -1174,6 +1174,123 @@ namespace render
 
 	void pump()
 	{
+		// --- export diagnostics ------------------------------------------
+		//
+		// "I pressed Export, it rendered the vanilla watermarked video, and the
+		// log says nothing" was unanswerable: every interesting fact was either
+		// logged once at startup or not at all. These three cover the ways it
+		// can fail without anyone noticing.
+		{
+			// 1. The addon coming and going. Reported once at init as "not seen
+			//    yet" and never again, so an addon that loads later - or dies
+			//    mid-session - left no trace at all.
+			static int  s_addonWas  = -1;
+			static bool s_saidInEd  = false;
+			const int   addonNow    = fxcapture::addonPresent() ? 1 : 0;
+			if (addonNow != s_addonWas)
+			{
+				if (s_addonWas != -1 || !addonNow)
+					logger::write("info",
+						"capture: addon %s (heartbeat=%u). Rendering needs this alive.",
+						addonNow ? "is now PRESENT" : "is NOT presenting",
+						fxcapture::heartbeat());
+				s_addonWas = addonNow;
+				s_saidInEd = false;   // re-state it once we are in the editor
+			}
+
+			// Say it AGAIN, once, when the editor is actually open.
+			//
+			// The startup report is ~1s into the process, long before ReShade
+			// necessarily has a device, so "not presenting" there means little -
+			// and a user reading their log sees one stale line and concludes
+			// nothing. Restating it at the moment rendering could be requested is
+			// the one that answers "why did Export fall back".
+			if (!s_saidInEd && game::isEditModeActive() && Config::get().enableRenderer)
+			{
+				s_saidInEd = true;
+				if (fxcapture::addonPresent())
+					logger::write("info",
+						"capture: editor open, addon PRESENT (heartbeat=%u) - Export will "
+						"render with RE+", fxcapture::heartbeat());
+				else
+					logger::write("info",
+						"capture: editor open but the addon is NOT presenting (channel=%s, "
+						"heartbeat=0). Export WILL fall back to the game's own encoder. "
+						"IgcsConnector.addon64 is either not loaded or never reaching its "
+						"present callback - check ReShade has add-on support, that the "
+						"add-on is enabled, and that nothing else (ENB) owns present.",
+						fxcapture::available() ? "mapped" : "NOT MAPPED");
+			}
+
+			// 2. Someone patching over our Open detour. Silent today: MinHook
+			//    reported success, the log said "hooked", and the bytes are gone.
+			static bool s_saidClobbered = false;
+			if (!s_saidClobbered && game::addr_PlaybackOpen && !exporthook::hookIntact())
+			{
+				s_saidClobbered = true;
+				logger::write("info",
+					"export: !! our Open detour is no longer at %p - another mod has "
+					"patched over it. Export will not reach RE+.",
+					(void*)game::addr_PlaybackOpen);
+			}
+
+			// 3. THE symptom, stated outright. If the game enters a bake that did
+			//    not come through our hook, the vanilla encoder is running and we
+			//    never saw the press - which is exactly the report we could not
+			//    diagnose. Say so, with every precondition, at the moment it
+			//    happens.
+			static int s_lastType = -2;
+			if (game::addr_g_PlaybackType)
+			{
+				const int t = *(int*)game::addr_g_PlaybackType;
+
+				// SEED on the first observation, never judge it.
+				//
+				// The first version evaluated the bake test on the very first
+				// read, and this global holds 1 at startup on at least some
+				// builds - so it fired one millisecond after init, eight seconds
+				// before the user had even opened the editor, and announced that
+				// the hook was on the wrong function. It was not; Export simply
+				// had not been pressed. Only a TRANSITION into bake means
+				// anything.
+				if (s_lastType == -2)
+				{
+					s_lastType = t;
+				}
+				else if (t != s_lastType)
+				{
+					const int prev = s_lastType;
+					s_lastType = t;
+					logger::write("info", "export: playback type %d -> %d", prev, t);
+
+					if (t == gsig::PLAYBACK_TYPE_BAKE && !exporthook::pending() &&
+					    s_step == Step::Idle)
+					{
+						logger::write("info",
+							"export: !! entered a BAKE we did not divert - this is the "
+							"vanilla encoder. Open intercepted %u time(s), detour %s, "
+							"renderer=%s, addon=%s, heartbeat=%u, channel=%s.",
+							exporthook::openCount(),
+							exporthook::hookIntact() ? "intact" : "OVERWRITTEN",
+							Config::get().enableRenderer ? "on" : "off",
+							fxcapture::addonPresent() ? "present" : "not presenting",
+							fxcapture::heartbeat(),
+							fxcapture::available() ? "mapped" : "NOT MAPPED");
+
+						if (!fxcapture::addonPresent())
+							logger::write("info",
+								"export:    the addon is not presenting, so this fallback is "
+								"BY DESIGN - see the capture line above. Fix ReShade/IGCS, "
+								"not the renderer.");
+						else if (exporthook::openCount() == 0)
+							logger::write("info",
+								"export:    Open was never intercepted, so the hook is on the "
+								"wrong function for this build.");
+					}
+				}
+			}
+		}
+
 		// A diverted Export lands here: Open() has returned, but playback needs
 		// a few frames before the replay clock is usable, so we retry rather
 		// than starting from inside the hook.

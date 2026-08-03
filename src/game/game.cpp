@@ -46,6 +46,8 @@ namespace game
 	uintptr_t addr_ReplayHeapAllocImm  = 0;
 	uintptr_t addr_ReplayHeapCtorImm   = 0;
 	bool      replayHeapWidenedEarly   = false;
+	uintptr_t addr_PacketWeatherExtract= 0;
+	uintptr_t addr_g_TcVarInfos        = 0;
 	uintptr_t addr_SetCursorSpeed      = 0;
 	uintptr_t addr_SetNextPlayBackState= 0;
 	uintptr_t addr_g_ReplayMode        = 0;
@@ -604,6 +606,24 @@ namespace game
 			addr_ReplayJumpTo = memory::scan(p).address;
 			logger::write("info", "  ReplayJumpTo         = %p (rva 0x%llX)", (void*)addr_ReplayJumpTo,
 				(uint64_t)(addr_ReplayJumpTo ? addr_ReplayJumpTo - memory::base() : 0));
+		}
+
+		// Optional: without it the clip keeps its own recorded time and weather.
+		if (const char* p = pick(gsig::PACKETWEATHER_EXTRACT); p && *p)
+		{
+			addr_PacketWeatherExtract = memory::scan(p).address;
+			logger::write("info", "  PacketWeatherExtract = %p (rva 0x%llX)",
+				(void*)addr_PacketWeatherExtract,
+				(uint64_t)(addr_PacketWeatherExtract ? addr_PacketWeatherExtract - memory::base() : 0));
+		}
+
+		// Optional: without it an overridden clip keeps its baked lighting.
+		if (const char* p = pick(gsig::TIMECYCLE_VARINFOS); p && *p)
+		{
+			addr_g_TcVarInfos = memory::scan(p).address;
+			logger::write("info", "  TimecycleVarTable    = %p (rva 0x%llX)",
+				(void*)addr_g_TcVarInfos,
+				(uint64_t)(addr_g_TcVarInfos ? addr_g_TcVarInfos - memory::base() : 0));
 		}
 
 		// Optional: without it a clip recorded in first person keeps the

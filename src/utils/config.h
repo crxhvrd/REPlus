@@ -297,6 +297,44 @@ struct Config
 	float zoomMinFov = 1.0f;
 	float zoomMaxFov = 130.0f;
 
+	// --- scene: the clip's time of day and weather -----------------------
+	// Both are recorded per frame and replayed, so these are substituted on
+	// their way out of the replay buffer rather than set afterwards - see
+	// scene.cpp. Nothing is written to the .clip; turn either off and the clip
+	// plays exactly as recorded again.
+	//
+	// Off by default, deliberately: the recorded time and weather are what the
+	// clip IS, and a mod that quietly re-lit every clip on first launch would
+	// be wrong even if the look were nicer.
+	bool  overrideTimeOfDay = false;
+	// Minutes past midnight, 0..1439. The menu steps it in quarter hours; the
+	// ini can hold any minute.
+	int   timeOfDay = 12 * 60;
+
+	bool  overrideWeather = false;
+	// Index into weather.xml's load order, matching what the clip records.
+	// scene.cpp has the stock name list.
+	int   weatherType = 0;          // EXTRASUNNY
+	// Second type to blend towards, or -1 for none. Blending is what the
+	// weather system does natively between two types, so a half-way state
+	// between CLEAR and RAIN is an ordinary value here rather than a hack.
+	int   weatherBlendTo = -1;
+	float weatherBlend   = 0.0f;    // 0..1, weatherType -> weatherBlendTo
+	// Wet roads and puddles, independent of the type. Negative keeps whatever
+	// the clip recorded, which is NOT the same as zero - a clip shot in the
+	// rain has wet ground that a dry preset should not necessarily scrub off.
+	float weatherWetness = -1.0f;
+
+	// A clip also records the fully RESOLVED timecycle keyframe every frame and
+	// replays it, which is why moving the clock on its own only moves the sun:
+	// the sky, ambient and fog are baked. On, the recorded keyframe is stood
+	// down while an override is active and the timecycle is evaluated live from
+	// the new time and weather. Off keeps the clip's own lighting, which is
+	// worth having when the clip carried a timecycle modifier - an interior
+	// grade, a mission colour grade - that the live evaluation cannot know
+	// about. Only does anything while a time or weather override is on.
+	bool  liveTimecycle = true;
+
 	// Which group of our rows the marker's CAMERA submenu is showing:
 	//   0 hidden   1 spline   2 sway   3 jitter   4 detail   5 axes
 	// Persisted so it survives a restart. Defaults to hidden - the row should
@@ -791,6 +829,29 @@ struct Config
 		if (zoomMinFov > 130.0f) zoomMinFov = 130.0f;
 		if (zoomMaxFov > 130.0f) zoomMaxFov = 130.0f;
 		if (zoomMaxFov < zoomMinFov) zoomMaxFov = zoomMinFov;
+
+		overrideTimeOfDay = getBool("OverrideTimeOfDay", overrideTimeOfDay);
+		timeOfDay = GetPrivateProfileIntA("RockstarEditorPlus", "TimeOfDay",
+			timeOfDay, ini.c_str());
+		if (timeOfDay < 0)    timeOfDay = 0;
+		if (timeOfDay > 1439) timeOfDay = 1439;
+
+		overrideWeather = getBool("OverrideWeather", overrideWeather);
+		weatherType = GetPrivateProfileIntA("RockstarEditorPlus", "WeatherType",
+			weatherType, ini.c_str());
+		weatherBlendTo = GetPrivateProfileIntA("RockstarEditorPlus", "WeatherBlendTo",
+			weatherBlendTo, ini.c_str());
+		weatherBlend   = getFloat("WeatherBlend", weatherBlend);
+		weatherWetness = getFloat("WeatherWetness", weatherWetness);
+		// Upper bounds are left to scene.cpp, which is the only thing that knows
+		// how many weather types there are. A negative BlendTo means "none" and
+		// a negative Wetness means "as recorded", so neither is clamped up here.
+		if (weatherType < 0)     weatherType = 0;
+		if (weatherBlend < 0.0f) weatherBlend = 0.0f;
+		if (weatherBlend > 1.0f) weatherBlend = 1.0f;
+		if (weatherWetness > 1.0f) weatherWetness = 1.0f;
+		liveTimecycle = getBool("LiveTimecycle", liveTimecycle);
+
 		bypassProfanityFilter   = getBool("BypassProfanityFilter", bypassProfanityFilter);
 		unlockCameraRestrictions = getBool("UnlockCameraRestrictions", unlockCameraRestrictions);
 		maxCameraDistance       = getFloat("MaxCameraDistance", maxCameraDistance);
