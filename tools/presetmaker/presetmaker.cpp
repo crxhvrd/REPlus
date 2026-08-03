@@ -54,6 +54,15 @@ struct Setting
     const char* choices;   // "Video|Frames"; for S_CHOICE the index is the value
     const char* help;      // tooltip and description strip
     bool        wide;      // lay out full width under the two columns
+
+    // S_CHOICE only: the ini stores the WORD ("Sliding"), not the index.
+    //
+    // A table flag rather than a name test in the save path, which is what
+    // this was. Adding a second word-valued key meant remembering to extend
+    // an `if` three hundred lines away - and forgetting writes "1" into a
+    // key the mod compares against "Sliding", so the setting reads back as
+    // its default and the tool looks like it did nothing.
+    bool        wordValue = false;
 };
 
 static Setting kSettings[] =
@@ -66,7 +75,12 @@ static Setting kSettings[] =
 { "RenderMode", "Output", S_CHOICE, "Video|Frames",
   "Video   - frames are handed to ffmpeg as they finish and deleted, so a long render costs a couple of files at a time. Audio is muxed in.\r\n"
   "Frames  - numbered PNG/JPEG sequence with an assemble.txt of ready-made ffmpeg commands. No audio.\r\n"
-  "The capture itself is identical either way.", false },
+  "The capture itself is identical either way.", false, true },
+
+{ "RenderCaptureMode", "Capture mode", S_CHOICE, "Walking|Sliding",
+  "Sliding - the clip PLAYS in slow motion: it advances to each frame's mark, then exposes Motion blur samples consecutive frames with the world still simulating between them. Particles step, and anything with temporal history (TAA, SSR, ray tracing) stays warm instead of being reset at every sample.\r\n"
+  "The default, and roughly 3x faster than Walking at a 360-degree shutter - it needs one frame per sample where Walking needs a settle frame too. That edge is shutter-dependent: it needs Samples/Shutter frames, so at 0.5 the two are level and below that Walking wins.\r\n"
+  "Walking - pause, seek to each sub-sample, grab, average. Exact shutter placement, deterministic frame times, and a more obvious failure mode: a repeated frame rather than a smeared one. Use it if a sliding render looks wrong, or for short shutters.", false, true },
 
 { "RenderFps", "Frame rate", S_INT, nullptr,
   "Output frame rate, independent of the rate the game is running at. Halving it halves the render time.", false },
@@ -74,11 +88,13 @@ static Setting kSettings[] =
 { "RenderSamples", "Motion blur samples", S_INT, nullptr,
   "Sub-frames averaged into each output frame. 1 = no blur.\r\n"
   "Every sample is a real render at a real instant, so this is true accumulation - and it is the dominant cost. "
-  "64 means 64 captures per output frame; drop to 3 while setting a shot up.", false },
+  "64 means 64 captures per output frame; drop to 3 while setting a shot up.\r\n"
+  "Exact in both capture modes. Walking seeks to each instant; sliding advances the clip to the frame's mark and then takes this many consecutive presents, with the world still simulating between them.", false },
 
 { "RenderShutter", "Shutter angle", S_FLOAT, nullptr,
   "1.0 exposes the whole frame interval (360 degrees). 0.5 is the 180-degree film convention.\r\n"
-  "Costs nothing either way - it only changes how the samples are spaced.", false },
+  "Free in Walking - it only changes how the samples are spaced.\r\n"
+  "In Sliding it also sets the target the playback speed is tuned to, so a shorter shutter means a slower playback and a longer render.", false },
 
 { "RenderSettleFrames", "Settle frames", S_INT, nullptr,
   "Frames to let the game redraw after seeking to a new output frame. Paid once per frame, so it barely matters at high sample counts "
@@ -110,10 +126,6 @@ static Setting kSettings[] =
 
 { "RenderQuality", "JPEG quality", S_INT, nullptr,
   "1 to 100. Only used when JPEG is on.", false },
-
-{ "RenderChannelOrder", "Colour channels", S_CHOICE, "Auto|RGBA|BGRA",
-  "Leave on Auto. Only force a value if rendered frames come out with red and blue swapped - an orange sky and cyan foliage.\r\n"
-  "Auto trusts ReShade, which normalises the back buffer to RGBA before any add-on sees it.", false },
 
 { "RenderVideoPreset", "Encoder preset", S_PRESET, nullptr,
   "A name from the presets folder - see the Encoder presets tab. A preset supplies both the ffmpeg arguments and the file extension, "
@@ -444,8 +456,7 @@ static void uiToSettings()
         case S_CHOICE:
         {
             const int idx = (int)SendMessageA(g_ctl[i], CB_GETCURSEL, 0, 0);
-            // RenderMode is stored as a word, the rest as an index.
-            if (_stricmp(s.key, "RenderMode") == 0) iniSet(s.key, comboText(g_ctl[i]));
+            if (s.wordValue) iniSet(s.key, comboText(g_ctl[i]));
             else { char b[16]; sprintf_s(b, "%d", idx < 0 ? 0 : idx); iniSet(s.key, b); }
             break;
         }
@@ -639,11 +650,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int rowY[2] = { 44, 44 };
         int wideY = 0, col = 0, placed = 0;
 
+        // Split the columns evenly for whatever the table holds rather than
+        // at a fixed eight. Both this and wideY below were hardcoded to the
+        // row count of the day, so adding a setting overflowed the left
+        // column straight through the wide text boxes underneath it.
+        int nonWide = 0;
+        for (int i = 0; i < kSettingCount; ++i) if (!kSettings[i].wide) ++nonWide;
+        const int perCol = (nonWide + 1) / 2;
+
         for (int i = 0; i < kSettingCount; ++i)
         {
             const Setting& s = kSettings[i];
             if (s.wide) continue;
-            col = (placed < 8) ? 0 : 1;
+            col = (placed < perCol) ? 0 : 1;
             const int x = colX[col], y = rowY[col];
 
             g_ctlLabel[i] = mk("STATIC", s.label, WS_VISIBLE, x, y + 4, 150, 18, hwnd, 0);
@@ -673,7 +692,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ++placed;
         }
 
-        wideY = 44 + 8 * 30 + 10;
+        wideY = 44 + perCol * 30 + 10;
         for (int i = 0; i < kSettingCount; ++i)
         {
             const Setting& s = kSettings[i];

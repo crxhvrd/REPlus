@@ -42,6 +42,11 @@ namespace render
 		int   quality      = 90;     // JPEG only
 		float highlight    = 0.0f;   // highlight lift during blur accumulation
 		int   channelOrder = 0;      // 0 auto / 1 RGBA / 2 BGRA
+
+		// 0 = walking (pause + seek per sub-sample), 1 = sliding (play the clip
+		// in slow motion and accumulate whatever is presented). See Config for
+		// why sliding exists and what it costs.
+		int   captureMode  = 0;
 	};
 
 	Settings& settings();

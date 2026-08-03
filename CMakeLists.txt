@@ -78,18 +78,20 @@ set_target_properties(RockstarEditorPlus PROPERTIES
 # =============================================================================
 set(REP_INI_MAIN [==[
 ; RockstarEditorPlus - editor settings.   Render settings are in Render.ini.
-; Most of this is also in the in-game menu ("Rockstar Editor+" row).
-; README.md explains the why; this file is just the what.
 ;
-; Inline "; ..." comments are safe on numbers and 0/1 only - on a PATH or STRING
-; key Windows' ini API keeps the comment as part of the value.
+; Everything here is also in the in-game menu, under the "Rockstar Editor+" row
+; of a marker's menu, where each row explains itself. This file is the terse
+; version, and what the menu writes back to.
+;
+; Inline "; ..." is safe after a NUMBER. Never after a path or a word - Windows
+; keeps the comment as part of the value.
 
 [RockstarEditorPlus]
 
 ; --- Camera -----------------------------------------------------------------
 Enabled=1                  ; 0 = stock game, no hooks at all
 SplinePosition=1           ; curved path instead of the straight-line blend
-SplineOrientation=1        ; splined rotation (look-at markers re-aim instead)
+SplineOrientation=1        ; splined rotation; look-at markers re-aim instead
 SplineFov=1                ; monotone zoom curve, no overshoot
 SplineAttached=1           ; also spline shots mounted on a car/bike/ped
 LookAtReaim=1              ; re-aim look-at markers after moving the camera
@@ -98,18 +100,18 @@ OnlySmoothBlend=1          ; 1 = only "Smooth" markers, 0 = "Linear" too
 
 ; Pacing. Natural is the default and overrides the two below it.
 NaturalPacing=1            ; path driven by marker times - eases into bends
-SmoothSpeedProfile=1       ; one speed curve across markers (Continuous)
-ArcLengthRemap=1           ; per-segment fallback, only used when both are 0
+SmoothSpeedProfile=1       ; one speed curve across markers
+ArcLengthRemap=1           ; per-segment fallback, used only when both are 0
 Alpha=1                    ; tension: 0 uniform / 0.5 centripetal / 1 chordal
-                           ; has no effect while NaturalPacing=1
+                           ; no effect while NaturalPacing=1
 
 ; --- Shake ------------------------------------------------------------------
-; Per-marker; set a marker's Shake row to "Rockstar Editor+" to use it. These
-; are the defaults each marker inherits. Handheld starting point: 2.0 @ 0.20.
+; Per-marker: set a marker's Shake row to "Rockstar Editor+". These are the
+; defaults each marker inherits. Handheld starting point: 2.0 @ 0.20.
 ShakeSimpleMode=1          ; 1 = Amplitude/Frequency, 0 = the Sway/Jitter model
-ShakeAmplitude=1.0         ; degrees of rotation, 0.05 m of travel per degree
+ShakeAmplitude=1.0         ; degrees; 0.05 m of travel per degree
 ShakeFrequency=0.35        ; Hz
-ShakeVariation=0.7         ; 0 = metronomic, higher = detuned and less regular
+ShakeVariation=0.7         ; 0 = metronomic, higher = less regular
 ShakeRoughness=3
 ShakeSeed=0                ; reroll without changing the character
 
@@ -120,10 +122,10 @@ ShakeSpeedRef=30.0         ; m/s that counts as "fully moving"
 ShakeStopWhenStill=0       ; 1 = fade out when parked
 
 ; Complex mode only - ignored while ShakeSimpleMode=1.
-SwayMove=0.0               ; slow, larger - the "handheld" layer
+SwayMove=0.0
 SwayRotate=0.0
 SwayFrequency=1.8
-JitterMove=0.0             ; fast, small - engine buzz and rattle
+JitterMove=0.0
 JitterRotate=0.0
 JitterFrequency=9.0
 
@@ -140,113 +142,80 @@ UnlimitedCameraDistance=1  ; lift the 30m leash off the player
 MaxCameraDistance=20000    ; the world streams near the player - expect LOD pop
 DisableCameraCollision=1   ; camera passes through geometry
 BypassProfanityFilter=1    ; naming/export still works with Social Club offline
-UnlockCameraRestrictions=1 ; free camera on first-person / cutscene clips
+UnlockCameraRestrictions=1 ; free camera on first-person clips
 HideEditorSpinner=1        ; no spinner ring while scrubbing
 UncapZoom=1                ; widen the stock 0.45x..4.50x range
 ZoomMinFov=1               ; 1..130 is the engine's own clamp
 ZoomMaxFov=130             ; readout is 45/fov: 1 = 45x in, 130 = 0.35x out
 
-; --- Recording length --------------------------------------------------------
-; HOW LONG A SINGLE CLIP CAN BE, in 4 MB blocks.
-;
-; The recording ring IS the clip: it fills, the clip is saved, and recording
-; rolls straight into a new one. So length = ring size / how fast the scene
-; fills it - which is exactly why a street full of traffic gives you seconds
-; where an empty road gives you a minute.
-;
-; The game ships 30 blocks (120 MB), and that is not its own preference: its
-; settings code force-clamps the count to 30 whenever the replay heap is under
-; ~196 MB, and the heap is 172 MB. We widen the heap first, so the clamp stops
-; firing and the count can go up.
-;
-; Measured in dense city traffic:
-;    30 blocks / 120 MB   ~17 seconds   (stock)
-;    64 blocks / 256 MB   ~44 seconds
-;   128 blocks / 512 MB   ~1m 45s
-;
-; COSTS, because 128 is the default and it is not free. The heap is sized for
-; the blocks plus a 384 KB thumbnail each, so this reserves about 604 MB of RAM
-; for the session, and clips grow to match - a 128-block clip is roughly 230 MB
-; on disk. Lower it if memory is tight; check the editor's own disk allowance
-; under Settings -> Saving & Startup if you shoot long clips.
-;
-; 3..128. Above 30 needs the heap widening to succeed - if it cannot (the sites
-; did not resolve on your build, or this machine cannot reserve the address
-; space) the value is clamped back to 30 and the log says which. Takes effect at
-; the next recording setup, so restart before recording.
-ReplayBlocks=128
-
-; --- Menu state (written for you) -------------------------------------------
-MenuGroup=0
-MenuStep=2                 ; 0=.001 1=.005 2=.01 3=.05 4=.1 5=.5 6=1
-MenuExpanded=0             ; 0 closed / 1 curve / 2 limits
+; --- Recording length -------------------------------------------------------
+; How long one clip can be, in 4 MB blocks. The ring IS the clip: it fills, the
+; clip saves, and recording rolls into a new one - so length is ring size over
+; how fast the scene fills it, which is why traffic shortens it. The game ships
+; 30 because it clamps to that whenever the replay heap is small; the heap is
+; widened first, so the clamp stops firing. 128 costs ~604 MB reserved and
+; records ~1m45 of dense city where stock gives ~17 seconds. Takes effect at the
+; next recording, so restart before shooting.
+ReplayBlocks=128           ; 3..128
 
 ; --- Diagnostics ------------------------------------------------------------
-ShakeDebugLog=0            ; log the shake amplitudes that reached the camera
-SplineDebugLog=0           ; log which curve path each frame took, once a second
-SplineTraceLog=0           ; per-frame camera trace -> spline-trace.log
-SplineDebugGain=1          ; exaggerate the curve's bow. 10 = obvious
+ShakeDebugLog=0
+SplineDebugLog=0
+SplineDebugGain=1          ; exaggerate the curve to see it. 0..100
+SplineTraceLog=0           ; one line per frame - noisy
+
+; Menu state, written for you when you change a row in-game.
+MenuExpanded=0
+MenuGroup=0
+MenuStep=2
 ]==])
 
 set(REP_INI_RENDER [==[
-; RockstarEditorPlus - render settings.   Editor settings are in
-; RockstarEditorPlus.ini. README.md covers the workflow.
+; RockstarEditorPlus - render settings.
 ;
-; Inline "; ..." comments are safe on numbers and 0/1 only - on a PATH or STRING
-; key Windows' ini API keeps the comment as part of the value.
+; "RE+ Render Settings.exe" in this folder edits every key here and explains
+; what each one does and costs. This file is only the terse version.
+;
+; Inline "; ..." is safe after a NUMBER. Never after a path or a word - Windows
+; keeps the comment as part of the value.
 
 [Render]
 
 ; --- Capture ----------------------------------------------------------------
-; EnableRenderer is the master switch: Export is the only trigger, and this is
-; what diverts it from the game's own encoder. Ships OFF because diverting the
-; bake means other export tools (EVE, EVER) silently never run.
-EnableRenderer=0
+EnableRenderer=0           ; master switch. Off = the game's own Export runs
 
+; Sliding = the clip plays; particles and TAA/SSR/RT stay live. Faster at 360.
+; Walking = pause and seek per sample; exact shutter. Better below 0.5 shutter.
+RenderCaptureMode=Sliding
 RenderFps=30               ; output rate, independent of your actual framerate
-RenderSamples=64           ; sub-frames averaged per frame. 1 = no motion blur
+RenderSamples=64           ; renders averaged per frame. 1 = no motion blur
 RenderShutter=1            ; 1.0 = 360 degrees, 0.5 = the 180 film convention
-RenderSettleFrames=3       ; redraw wait after seeking to a new output frame
-RenderSettleSubFrames=1    ; ...between blur sub-samples. Never 0
-RenderHighlightBoost=0.9   ; keeps specular streaks bright through accumulation
+RenderSettleFrames=3       ; Walking: redraw wait after a new-frame seek
+RenderSettleSubFrames=1    ; Walking: wait between sub-samples. Never 0
+RenderHighlightBoost=0.9   ; keeps speculars bright through accumulation
 RenderJpeg=0               ; 0 = PNG
 RenderQuality=90           ; JPEG only
-RenderChannelOrder=0       ; 0 auto / 1 RGBA / 2 BGRA - only if red and blue swap
 RenderHideHud=1            ; hide the editor HUD and cursor while rendering
-ExportCloseWhenDone=1      ; return to the editor menus when the render finishes
+ExportCloseWhenDone=1      ; return to the editor menus when done
 ; Empty = RockstarEditorPlus\Captures\
 RenderOutputFolder=
-
 ; --- Output -----------------------------------------------------------------
-; Video  = streamed to ffmpeg as frames finish, then deleted
-; Frames = numbered PNG/JPEG sequence with an assemble.txt beside it
-; The capture is identical either way; this is only the deliverable.
+; Video = streamed to ffmpeg and deleted. Frames = sequence + assemble.txt.
 RenderMode=Video
-RenderKeepFrames=0         ; Video mode: keep the frames as well
-; Empty = RockstarEditorPlus\ffmpeg.exe, then beside the exe, then PATH.
+RenderKeepFrames=0         ; Video mode: keep the frames too
+; Empty = the bundled copy, then beside the exe, then PATH.
 FfmpegPath=
 
-; Named preset from presets\ (h264, h265, nvenc_hevc, prores_hq, lossless).
-; A preset supplies both args and extension, overriding the two below.
+; Named preset from presets\ - supplies args AND extension, overriding both
+; keys below. h264, h265, nvenc_hevc, prores_hq, lossless.
 RenderVideoPreset=
-
-; Used when no preset is named. Ext must match the codec or ffmpeg refuses.
 RenderVideoArgs=-c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p
 RenderVideoExt=mp4
 
 ; --- Audio ------------------------------------------------------------------
-; One Export press does both passes: the project plays through once to capture
-; sound, then rewinds and renders the frames. Needs RenderMode=Video.
-RenderAudio=1
-; Or borrow the track from an existing file, normally a stock export of the same
-; project. Ignored while RenderAudio is on.
+RenderAudio=1              ; one Export: a sound pass, then the frames. Video only
+; Borrow a track from a file instead. Ignored while RenderAudio=1.
 AudioFromFile=
-
-; --- Depth of field ---------------------------------------------------------
-; Driven entirely from ReShade's overlay - nothing to configure here. Needs the
-; editor open, a free-camera marker, playback PAUSED, and IgcsDof.fx installed.
-; For STATIC shots: the replay clock never moves during a session. Motion blur
-; is the renderer's job above, where the shutter is exact.
 ]==])
 
 # Staged inside the build tree, never in the source tree.

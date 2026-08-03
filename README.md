@@ -291,6 +291,38 @@ Progress and an estimate go to the log every 15 seconds.
 
 ---
 
+## Capture modes
+
+`RenderCaptureMode` in `Render.ini`. Both average `RenderSamples` real renders
+into every output frame — the difference is what the world does between them.
+
+| | Sliding *(default)* | Walking |
+|---|---|---|
+| the clip | plays, in slow motion | paused, seeked per sample |
+| particles, TAA, SSR, RT | keep simulating | reset at every sample |
+| shutter | approximate | exact midpoints |
+| frames per output frame | `samples / shutter` | `2·samples + 2` |
+| 64 samples @ 360° | **~1.6 s/frame** | ~4.6 s/frame |
+
+Sliding advances to each frame's mark, then exposes N consecutive frames with
+the world still running. That keeps anything with temporal history warm, which a
+seeked frame cannot — every walking sample starts cold.
+
+It is also faster at the default 360° shutter, because it spends one frame per
+sample where walking also needs a settle frame. **That edge is shutter-dependent**
+— it needs `samples / shutter` frames, so at 0.5 the two are level and below that
+walking wins.
+
+Walking is still the more predictable one: exact shutter placement, deterministic
+frame times, and it fails obviously — a repeated frame rather than a smeared one.
+Reach for it if a sliding render looks wrong, or for short shutters.
+
+The playback speed sliding uses is measured, not configured: it times one frame
+during a warm-up and solves for the speed that makes N samples span the shutter,
+then holds it. The log reports what it settled on.
+
+---
+
 ## Depth of field
 
 The capture add-on can walk the camera around a lens aperture and blend the

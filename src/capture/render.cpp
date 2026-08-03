@@ -27,6 +27,7 @@ namespace render
 			Settle,   // waiting for the game to render at the time we jumped to
 			Ack,      // waiting for the addon to acknowledge our capture request
 			Audio,    // playing at normal speed, recording sound, no frames
+			Slide,    // the clip is PLAYING; accumulate whatever is presented
 			ClipJump, // waiting for a clip step we asked the engine for
 			Rewind,   // audio done, going back to clip 1 to start the frames
 			Done,
@@ -47,6 +48,72 @@ namespace render
 		bool  s_openEnded = false;  // stop when the clock stops following us
 		int   s_shortRuns = 0;      // consecutive seeks that fell short
 		float s_lastClock  = -1.0f; // clock at the previous check, to spot a clip restart
+
+		// --- sliding renderer ------------------------------------------------
+		//
+		// Clip time accumulated so far, summed from the replay clock rather than
+		// taken from it. The clock RESTARTS at every clip, so it is a position
+		// inside the clip on screen and not a position in the project - summing
+		// the per-present deltas and refusing the negative ones is what turns it
+		// into a project-long timeline that output frames can be cut from.
+		double s_slideTime   = 0.0;
+		int    s_slideSample = 0;    // samples accumulated into the current frame
+		bool   s_slideFlush  = false;// a flush was posted; collect it next present
+
+		// Live playback speed, steered to hit RenderSamples.
+		//
+		// Sample count in a sliding render is P/(F*S) - present rate over output
+		// rate times speed - and P is not knowable in advance: it depends on the
+		// scene, the resolution and how expensive the capture turns out to be. So
+		// asking the user for a SPEED means asking them to predict their own frame
+		// rate, which is no way to request "16 samples".
+		//
+		// So it is DERIVED, never configured: measured once from the first
+		// frame's advance phase, then held against drift by the controller in
+		// the flush below. There is deliberately no ini key - the only value a
+		// person could supply is a worse one than the measurement.
+		float s_slideSpeed   = 0.05f;
+		bool  s_slideCapture = false;// false = advancing to the mark, true = exposing
+		double s_slideMark   = 0.0;  // clip time at which this frame's exposure opened
+		int   s_slideLogged  = 0;    // last speed reported, to keep the log quiet
+		double s_slideStep   = 0.0;  // clip ms one present covers, smoothed
+		bool  s_slideCalib   = false;// AUTO has taken its measurement
+		int   s_slideWarm    = 0;    // presents spent measuring before frame 0
+
+		// sampleCount handed to the addon for a sample that is NOT the last one.
+		// It only has to exceed the index, since the addon averages and writes on
+		// `sampleIndex >= sampleCount - 1` and merely accumulates otherwise - so
+		// this is "do not flush yet" rather than a real count. The true divisor
+		// is sent with the final sample, once it is known.
+		constexpr uint32_t kSlideOpen = 1u << 24;
+
+		// Where AUTO begins before it has measured anything. Any value the
+		// clip visibly advances at will do - it survives exactly one frame's
+		// advance phase.
+		// Deliberately far too SLOW rather than a best guess.
+		//
+		// The first frame is exposed before anything has been measured, and the
+		// two failure directions are not symmetric: too slow costs a couple of
+		// under-blurred frames at the head, too fast bakes a smear. At 0.1x the
+		// first frame came out spanning 1373ms of a 33ms shutter - over a second
+		// of the clip crushed into one image.
+		constexpr float kSlideSeed = 0.005f;
+
+		// Presents to spend measuring before the first frame is exposed.
+		//
+		// Frame 0 has no advance phase to measure during - its mark is zero, so
+		// the capture starts on the very first present - which is exactly how the
+		// seed reached the shutter unchallenged. These are pre-roll: the clip
+		// moves a fraction of a millisecond at the seed speed and the output
+		// timeline is rebased afterwards, so nothing is lost from the head.
+		constexpr int kSlideWarm = 12;
+
+		// Warm-up presents are CHEAP - nothing is being captured - while exposure
+		// presents carry a full read-back and accumulate, and ran 2-6x slower in
+		// practice. So a speed derived from warm-up alone comes out too high.
+		// Bias it down and let the controller climb: the climb costs a few soft
+		// frames, the alternative costs a smeared one.
+		constexpr float kSlideCalibBias = 0.35f;
 
 		// Project time is OURS; the game seeks in the current clip's own time.
 		// s_clipBase is where the live clip starts in its timeline, s_clipProjAt
@@ -496,7 +563,16 @@ namespace render
 			// blur variants above differ in their filters and rates, and adding
 			// the same three arguments to each would triple the file for no
 			// gain. Appended once, applies to whichever line you pick.
-			const std::string& au = Config::get().audioFromFile;
+			//
+			// The wav THIS render just captured wins over AudioFromFile.
+			//
+			// In Frames mode the audio pass still runs - a full real-time
+			// playthrough - but there is no encoder for it to be muxed into, so
+			// without naming it here that pass was paid for and then silently
+			// wasted: the wav sat in the folder and the only file telling you
+			// how to assemble anything pointed somewhere else.
+			const std::string& au = !s_pendingWav.empty() ? s_pendingWav
+			                                              : Config::get().audioFromFile;
 			if (!au.empty())
 			{
 				fprintf(f, "\nAudio: insert this before the output filename on"
@@ -544,6 +620,13 @@ namespace render
 				// waiting out a close, counting frames in the frontend, and
 				// hoping the re-open lands - none of which has to happen now.
 				//
+				// An audio pass that did NOT finish leaves a partial wav, and
+				// leaving the path set hands it to the next Export - which then
+				// skips its own audio pass, adopts a truncated take, and reuses
+				// this render's folder on top of it. Drop it here so the next
+				// press starts clean.
+				if (!complete) s_pendingWav.clear();
+
 				// `complete` gates it: a CANCELLED audio pass must not go on to
 				// render frames the user just asked to stop.
 				if (complete && !s_pendingWav.empty() && rewindToProjectStart())
@@ -608,7 +691,16 @@ namespace render
 			}
 			// One wav per pair of presses. Leaving it set would silently attach
 			// the previous project's audio to the next render.
-			if (complete && !s_pendingWav.empty())
+			//
+			// UNCONDITIONAL, including on an abort. It used to be gated on
+			// `complete`, so every failed render - addon gone, stuck loading,
+			// clip step never landed - left the path set. The next Export then
+			// did three wrong things at once: skipped its own audio pass, muxed
+			// the stale wav, and took the folder-REUSE branch in begin(), writing
+			// its frames and video.mp4 straight over the previous render's
+			// output. The overwrite is the serious one - it is silent data loss
+			// from a render that merely failed.
+			if (!s_pendingWav.empty())
 			{
 				s_pendingWav.clear();
 				videoout::setAudio("");
@@ -789,6 +881,7 @@ namespace render
 		s_cfg.quality      = c.renderQuality;
 		s_cfg.highlight    = c.renderHighlight;
 		s_cfg.channelOrder = c.renderChannelOrder;
+		s_cfg.captureMode  = c.renderCaptureMode;
 
 		// State the destination at startup, not only when a render begins.
 		//
@@ -915,6 +1008,11 @@ namespace render
 			rebaseClip("start");
 			game::jumpProjectTo(seekTime(), 0);
 
+			s_slideTime   = 0.0;
+			s_slideSample = 0;
+			s_slideFlush  = false;
+			s_audioStall  = 0;   // doubles as the sliding clock-stall counter
+
 			// Take the editor's HUD down for the duration. Same flag the
 			// hide-HUD key uses, so this is the game's own path - and Open()
 			// sets it back to true on the next playback either way.
@@ -931,6 +1029,39 @@ namespace render
 			s_startTick  = GetTickCount();
 			s_lastReport = s_startTick;
 			s_lastBeat = fxcapture::heartbeat();
+
+			// Sliding: let the clip PLAY, slowly, and take whatever is presented.
+			//
+			// The seek above still ran, and is still wanted - it puts the playhead
+			// at the start before anything rolls. From here the engine drives the
+			// clock, including stepping clips on its own, exactly as it does for
+			// the audio pass.
+			if (s_cfg.captureMode == 1)
+			{
+				// A seed, not a setting. The advance phase of the first frame
+				// measures what one present is worth and solves for the real
+				// speed before anything is exposed, so this only has to be
+				// somewhere the clip visibly moves and nothing more.
+				s_slideSpeed  = kSlideSeed;
+				s_slideCalib  = false;
+				s_slideWarm   = 0;
+				s_slideStep   = 0.0;
+				s_slideCapture = false;
+				s_slideLogged = 0;
+				game::playbackSetSpeed(s_slideSpeed);
+				game::playbackPlay();
+				s_lastClock = -1.0f;
+				s_step      = Step::Slide;
+				logger::write("info",
+					"render: SLIDING - %d sample(s) per frame at a %.0f-degree shutter, "
+					"starting at %.3gx. The clip plays, so particles and any temporal "
+					"accumulation stay live; the speed self-tunes so the samples span "
+					"the shutter.",
+					s_cfg.samples < 1 ? 1 : s_cfg.samples, s_cfg.shutter * 360.0f,
+					s_slideSpeed);
+				return true;
+			}
+
 			s_wait     = s_cfg.settleFrames;
 			s_step     = Step::Settle;
 			return true;
@@ -1276,6 +1407,23 @@ namespace render
 				return;
 			}
 
+			// Sliding is a playthrough too, so it needs the same treatment and
+			// none of the frame-pass repair below. Running that here would pause
+			// the clip and drop the state machine into Settle - which is exactly
+			// the bug the audio case above exists to avoid, and it would strand a
+			// sliding render on the first clip boundary.
+			//
+			// The engine restores ITS saved speed across a transition, so the
+			// slow motion has to be re-asserted rather than assumed.
+			if (s_step == Step::Slide)
+			{
+				game::playbackSetSpeed(s_slideSpeed);
+				game::playbackPlay();
+				s_lastClock  = -1.0f;   // the new clip's clock has its own base
+				s_audioStall = 0;
+				return;
+			}
+
 			// The rewind between the two passes goes through a transition too.
 			// Let its own waiter below decide when it has landed - there is no
 			// frame-pass state to repair yet.
@@ -1490,6 +1638,247 @@ namespace render
 		if (beat == 0) { finish("aborted - capture addon went away", false); return; }
 		s_lastBeat = beat;
 
+		// ---------------------------------------------------------------------
+		//  SLIDING: the clip PLAYS; each output frame is advance-then-capture.
+		// ---------------------------------------------------------------------
+		//  Two phases per output frame, which is what makes the sample count exact
+		//  rather than emergent:
+		//
+		//    ADVANCE - let the clip run until the accumulated clock reaches this
+		//              frame's mark. Nothing is captured; these presents are the
+		//              cost of moving the world forward.
+		//    CAPTURE - take exactly RenderSamples consecutive presents, indices
+		//              0..N-1, and let the addon average them. The world keeps
+		//              simulating between them, which is the entire point of this
+		//              mode - particles step, and TAA/SSR/RT history stays warm.
+		//
+		//  The first version of this took "whatever presents happened to land in
+		//  the interval", so RenderSamples did nothing and the count moved with the
+		//  frame rate. Separating the two phases fixes that: the count is asked for
+		//  and delivered, and what varies instead is how much CLIP TIME those N
+		//  samples span - which is the shutter, and is what the speed now steers.
+		//
+		//  One present per sample. The addon captures inside its present handler
+		//  and acks there, and this runs from the camera update earlier in the same
+		//  frame, so posting sample j+1 on the next tick never races sample j. The
+		//  ack is still checked before posting - if the addon ever misses a present
+		//  we would otherwise skip an index and hand it a short average.
+		// ---------------------------------------------------------------------
+		if (s_step == Step::Slide)
+		{
+			if (s_slideFlush)
+			{
+				if (!fxcapture::lastDone()) return;
+
+				if (videoout::active())
+				{
+					char done[MAX_PATH];
+					buildPath(done, sizeof(done));
+					videoout::pushFrame(done);
+				}
+				s_slideFlush   = false;
+				s_slideCapture = false;
+				s_slideSample  = 0;
+
+				// Steer the speed so the N samples span the SHUTTER.
+				//
+				// With the count now fixed, the free variable is how much clip time
+				// they cover. Too fast and N samples smear across more than the
+				// frame interval, which also overshoots the next mark and starves
+				// the advance phase; too slow and the blur trail is shorter than
+				// asked for and the render takes longer than it needs to.
+				//
+				// Deliberately NOT proportional. A measured span of one frame is a
+				// noisy sample of a rate that moves on its own, so this nudges by a
+				// fixed factor only when the answer is clearly outside the band -
+				// the same shape as the controller in the free-roam renderer, which
+				// settles instead of oscillating.
+				if (s_cfg.samples > 1)
+				{
+					const double want     = (double)s_dt * (double)s_cfg.shutter;
+					const double consumed = s_slideTime - s_slideMark;
+
+					// Two regimes. A small error is trimmed gently, because one
+					// frame is a noisy sample of a rate that moves on its own and
+					// chasing it exactly oscillates. A LARGE error is not noise -
+					// it is a wrong operating point, and nudging it by 25% a frame
+					// took fourteen frames to walk back from one bad start. Solve
+					// those directly, bounded so a single freak frame cannot throw
+					// the speed across its whole range.
+					if (consumed > want * 1.5 || consumed < want * 0.5)
+					{
+						double k = want / (consumed > 0.0 ? consumed : want);
+						if (k < 0.1) k = 0.1;
+						if (k > 4.0) k = 4.0;
+						s_slideSpeed = (float)((double)s_slideSpeed * k);
+					}
+					else if (consumed > want * 1.15) s_slideSpeed *= 0.90f;
+					else if (consumed < want * 0.85) s_slideSpeed *= 1.10f;
+
+					if (s_slideSpeed < 0.001f) s_slideSpeed = 0.001f;
+					if (s_slideSpeed > 1.0f)   s_slideSpeed = 1.0f;
+					game::playbackSetSpeed(s_slideSpeed);
+
+					const int shown = (int)(s_slideSpeed * 10000.0f);
+					if (shown != s_slideLogged)
+					{
+						s_slideLogged = shown;
+						logger::write("info",
+							"render: sliding - %d sample(s) spanned %.1fms of a %.1fms "
+							"shutter; speed now %.4gx",
+							s_cfg.samples, consumed, want, s_slideSpeed);
+					}
+				}
+
+				if (++s_frame >= s_frames) { finish("finished", true); return; }
+
+				const uint32_t now = GetTickCount();
+				if (now - s_lastReport >= kReportEveryMs)
+				{
+					s_lastReport = now;
+					const float elapsed = (now - s_startTick) / 1000.0f;
+					logger::write("info",
+						"render: %d/%d frames, %.0fs elapsed, clip time %.1fs",
+						s_frame, s_frames, elapsed, s_slideTime * 0.001);
+				}
+			}
+
+			if (!game::addr_g_ReplayTimeMs) { finish("aborted - no replay clock", false); return; }
+
+			// Follow the engine across clips, and stop when it wraps - the same
+			// rule the audio pass uses, because a full-project preview does not
+			// stop at the end, it returns to clip one.
+			const int at = game::clipIndex();
+			bool clipChanged = false;
+			if (s_clipN > 0 && at >= 0)
+			{
+				if (at < s_clipAt) { finish("finished - playback wrapped back to clip 1", true); return; }
+				clipChanged = at > s_clipAt;
+				if (clipChanged)
+					logger::write("info", "render: sliding onto clip %d/%d at frame %d",
+						at + 1, s_clipN, s_frame);
+				s_clipAt = at;
+			}
+
+			// Nothing usable is on screen during a load, and the clock is not
+			// moving either, so contribute neither a sample nor any time.
+			if (game::replayBusy() || s_spinnerSeen)
+			{
+				s_spinnerSeen = false;
+				s_lastClock   = -1.0f;
+				return;
+			}
+
+			const float clock = *(float*)game::addr_g_ReplayTimeMs;
+
+			// Accumulate clip time, refusing the deltas that are not playback:
+			// negative is a new clip or a restart, and an implausibly large jump is
+			// a hitch or a seek. Crediting either slides the output timeline
+			// against the picture.
+			if (s_lastClock >= 0.0f && !clipChanged)
+			{
+				const float delta = clock - s_lastClock;
+				if (delta > 0.0f && delta < s_dt * 4.0f)
+				{
+					s_slideTime += delta;
+					// How much clip time one present covers, smoothed. This is the
+					// whole measurement AUTO needs: it already folds in the present
+					// rate and the current speed, so no assumption about either.
+					s_slideStep = (s_slideStep <= 0.0) ? delta : s_slideStep * 0.8 + delta * 0.2;
+				}
+
+				// A clock that stops while nothing is loading is the project having
+				// ended on its last clip.
+				if (delta <= 0.0f)
+				{
+					if (++s_audioStall >= kAudioStall)
+					{
+						finish("finished - the clock stopped", true);
+						return;
+					}
+				}
+				else s_audioStall = 0;
+			}
+			s_lastClock = clock;
+
+			// --- WARM-UP ------------------------------------------------------
+			//
+			// Measure before exposing anything. Frame 0's mark is zero, so without
+			// this the capture begins on the first present and the seed speed goes
+			// straight into the shutter - which is how a 33ms exposure came out
+			// spanning 1373ms of clip.
+			if (!s_slideCalib)
+			{
+				++s_slideWarm;
+
+				// Throw away the first half of the measurement.
+				//
+				// playbackSetSpeed does not take effect on the present that
+				// issues it, so the earliest deltas are still at whatever speed
+				// the clip was running at before - which for the frame pass is
+				// 1.0x. Averaging those in reads the OLD speed: the log showed
+				// "one present covers 9.213ms of clip at 0.005x", implying 1.8
+				// seconds per present, when the true figure was ~0.4ms. The
+				// calibration came out ~23x too slow and the controller needed
+				// five frames to climb back - five visibly under-blurred frames,
+				// in the output, at the head of every render.
+				//
+				// Resetting the average here means only deltas measured at the
+				// speed we actually set reach it.
+				if (s_slideWarm == kSlideWarm / 2) s_slideStep = 0.0;
+
+				if (s_slideWarm < kSlideWarm || s_slideStep <= 0.0) return;
+
+				s_slideCalib = true;
+
+				const int    n    = s_cfg.samples < 1 ? 1 : s_cfg.samples;
+				const double want = (n > 1) ? (double)s_dt * (double)s_cfg.shutter
+				                            : (double)s_dt * 0.1;
+				const double have = s_slideStep * (double)n;
+				if (have > 0.0)
+				{
+					float ns = (float)((double)s_slideSpeed * want / have) * kSlideCalibBias;
+					if (ns < 0.001f) ns = 0.001f;
+					if (ns > 1.0f)   ns = 1.0f;
+					logger::write("info",
+						"render: sliding AUTO - one present covers %.3fms of clip at "
+						"%.4gx, so %d sample(s) start at %.4gx for a %.1fms shutter",
+						s_slideStep, s_slideSpeed, n, ns, want);
+					s_slideSpeed  = ns;
+					s_slideLogged = (int)(ns * 10000.0f);
+					game::playbackSetSpeed(s_slideSpeed);
+				}
+
+				// The warm-up was pre-roll, not output time. Rebasing here means
+				// frame 0 starts from wherever the measurement left the playhead
+				// instead of carrying a head offset for the whole render.
+				s_slideTime = 0.0;
+				s_lastClock = -1.0f;   // the next delta belongs to the new speed
+				return;
+			}
+
+			// --- ADVANCE ------------------------------------------------------
+			if (!s_slideCapture)
+			{
+				if (s_slideTime < (double)s_frame * (double)s_dt) return;
+				s_slideCapture = true;
+				s_slideSample  = 0;
+				s_slideMark    = s_slideTime;   // where this frame's exposure opened
+			}
+
+			// --- CAPTURE ------------------------------------------------------
+			if (!fxcapture::lastDone()) return;   // the addon missed a present
+
+			const int want = s_cfg.samples < 1 ? 1 : s_cfg.samples;
+
+			char path[MAX_PATH];
+			buildPath(path, sizeof(path));
+			fxcapture::requestSample(path, want, s_slideSample);
+
+			if (++s_slideSample >= want) s_slideFlush = true;
+			return;
+		}
+
 		switch (s_step)
 		{
 		case Step::Settle:
@@ -1538,6 +1927,17 @@ namespace render
 			// project into a fact - there is no clip after this one - instead of
 			// the ten-strikes-and-assume below.
 			// ---------------------------------------------------------------
+			// Whether the clip table answered THIS time, not merely whether it
+			// answered at the start.
+			//
+			// These accessors go through the playback controller and can decline
+			// - they need the replay mode to be right, and a render spends time
+			// in transitions where it is not. Keyed on s_clipN alone, a decline
+			// took the clip branch, found nothing to do, and SKIPPED the
+			// end-of-timeline fallback below because that was an `else if`. On an
+			// open-ended render (s_frames = INT_MAX) nothing else stops it, so
+			// the render simply never ended.
+			bool clipEndKnown = false;
 			if (s_clipN > 0)
 			{
 				float lo = 0.0f, hi = 0.0f;
@@ -1545,15 +1945,20 @@ namespace render
 				// Half a millisecond of tolerance: seekTime() lands exactly on
 				// hi at the last frame of a clip whose length divides evenly,
 				// and that frame is this clip's, not the next one's.
-				if (game::clipRange(lo, hi) && seekTime() > hi + 0.5f)
+				if (game::clipRange(lo, hi))
 				{
-					if (s_clipAt + 1 < s_clipN) { advanceClip(hi); return; }
-					finish("finished - end of the last clip", true);
-					return;
+					clipEndKnown = true;
+					if (seekTime() > hi + 0.5f)
+					{
+						if (s_clipAt + 1 < s_clipN) { advanceClip(hi); return; }
+						finish("finished - end of the last clip", true);
+						return;
+					}
 				}
 			}
 
-			// End of the project, for open-ended renders with no clip table.
+			// End of the project, for open-ended renders with no clip table -
+			// and for the clip-aware ones whenever the table declined above.
 			//
 			// Both sides are now in the CLIP's own time - seekTime() is what we
 			// actually asked the engine for, and the clock reports the same
@@ -1562,7 +1967,7 @@ namespace render
 			// here existed only because project time was being compared against
 			// clip time, and re-basing on transition removed the mismatch it was
 			// trying to paper over.
-			else if (s_openEnded && game::addr_g_ReplayTimeMs)
+			if (!clipEndKnown && s_openEnded && game::addr_g_ReplayTimeMs)
 			{
 				const float want = seekTime();
 				const float have = *(float*)game::addr_g_ReplayTimeMs;

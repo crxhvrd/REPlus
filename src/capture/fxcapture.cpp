@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 namespace fxcapture
 {
@@ -101,10 +102,27 @@ namespace fxcapture
 	}
 
 	bool available()    { return s_block != nullptr; }
-	bool addonPresent() { return s_block && s_block->addonHeartbeat != 0; }
-	bool lastDone()     { return !s_block || s_block->ackId == s_block->requestId; }
 
-	uint32_t heartbeat() { return s_block ? s_block->addonHeartbeat : 0; }
+	// Read through volatile.
+	//
+	// These three are written by ANOTHER PROCESS - the capture addon - and are
+	// polled here in a loop that does nothing else. Read as plain fields, the
+	// compiler is entitled to hoist them out of the caller's polling loop and
+	// spin forever on a stale copy; nothing in the source tells it the value can
+	// change under it. The block is shared memory, so it never can be cached
+	// that way safely.
+	namespace
+	{
+		inline uint32_t vread(const uint32_t& field)
+		{
+			return *(const volatile uint32_t*)&field;
+		}
+	}
+
+	bool addonPresent() { return s_block && vread(s_block->addonHeartbeat) != 0; }
+	bool lastDone()     { return !s_block || vread(s_block->ackId) == vread(s_block->requestId); }
+
+	uint32_t heartbeat() { return s_block ? vread(s_block->addonHeartbeat) : 0; }
 
 	bool requestSample(const char* fullPath, int sampleCount, int sampleIndex)
 	{
@@ -115,9 +133,20 @@ namespace fxcapture
 		s_block->sampleIndex = (uint32_t)sampleIndex;
 		s_block->status      = 0;
 
+		// The ordering below is the entire handshake, so it needs a barrier
+		// rather than a comment.
+		//
+		// x86 will not reorder the stores at run time, but the COMPILER will:
+		// none of these fields is volatile and the increment does not depend on
+		// the path copy, so at /O2 it is free to sink the copy past the bump.
+		// The addon would then act on a request whose outPath is still the
+		// previous frame's - which writes one frame twice and loses another,
+		// and only under optimisation, on some builds, some of the time.
+		std::atomic_thread_fence(std::memory_order_release);
+
 		// Bumped LAST, so every field is in place before the addon can see the
 		// request. Same ordering rule as Simple Camera's writer.
-		s_block->requestId += 1;
+		*(volatile uint32_t*)&s_block->requestId = s_block->requestId + 1;
 		return true;
 	}
 

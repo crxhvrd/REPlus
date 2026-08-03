@@ -31,11 +31,6 @@
 // =============================================================================
 namespace videoout
 {
-	// Combines an already-written video with a wav into a new file, returning
-	// its path (or "" on failure). Used by the audio pass, which by definition
-	// cannot have its wav ready while the frames are still streaming.
-	const char* mux(const char* videoPath, const char* wavPath);
-
 	// Overrides AudioFromFile for the next encode. Set by the render when a
 	// real-time audio pass has produced a wav of its own.
 	void setAudio(const char* path);

@@ -157,74 +157,6 @@ namespace videoout
 		return s_started && s_stdin != nullptr;
 	}
 
-	// Combine an already-finished video with a wav.
-	//
-	// A separate ffmpeg run, unlike the AudioFromFile path which folds the audio
-	// into the encode as a second input. It has to be: the wav from the
-	// real-time pass does not exist until after the frames are written, so there
-	// is nothing to hand the encoder while it is still running.
-	//
-	// The video stream is copied, never re-encoded - it is already exactly what
-	// the render produced, and a second lossy pass over it for the sake of
-	// attaching audio would be a pointless quality loss.
-	const char* mux(const char* videoPath, const char* wavPath)
-	{
-		static char out[MAX_PATH]{};
-		out[0] = '\0';
-		if (!videoPath || !*videoPath || !wavPath || !*wavPath) return out;
-
-		const std::string exe = findFfmpeg();
-		if (exe.empty())
-		{
-			logger::write("info", "video: no ffmpeg for the audio mux - video left silent");
-			return out;
-		}
-
-		// Written beside the silent original rather than over it: if the mux
-		// fails halfway there is still a playable video on disk.
-		std::string dst = videoPath;
-		const size_t dot = dst.find_last_of('.');
-		const std::string ext = (dot == std::string::npos) ? std::string("mp4") : dst.substr(dot + 1);
-		if (dot != std::string::npos) dst.erase(dot);
-		dst += "_audio." + ext;
-
-		char cmd[2048];
-		snprintf(cmd, sizeof(cmd),
-			"%s -hide_banner -loglevel error -y -i %s -i %s "
-			"-map 0:v -map 1:a -c:v copy -c:a aac -b:a 320k -shortest %s",
-			quoted(exe.c_str()).c_str(),
-			quoted(videoPath).c_str(),
-			quoted(wavPath).c_str(),
-			quoted(dst.c_str()).c_str());
-
-		STARTUPINFOA si{};
-		si.cb = sizeof(si);
-		si.dwFlags = STARTF_USESHOWWINDOW;
-		si.wShowWindow = SW_HIDE;
-		PROCESS_INFORMATION pi{};
-		if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
-			CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-		{
-			logger::write("info", "video: could not start the audio mux");
-			return out;
-		}
-		WaitForSingleObject(pi.hProcess, 120000);
-		DWORD code = 1;
-		GetExitCodeProcess(pi.hProcess, &code);
-		CloseHandle(pi.hThread);
-		CloseHandle(pi.hProcess);
-
-		if (code != 0)
-		{
-			logger::write("info", "video: audio mux failed (ffmpeg exit %lu) - video left silent", code);
-			return out;
-		}
-
-		snprintf(out, sizeof(out), "%s", dst.c_str());
-		logger::write("info", "video: muxed audio -> %s", out);
-		return out;
-	}
-
 	std::string s_audioOverride;
 	void setAudio(const char* path) { s_audioOverride = path ? path : ""; }
 
@@ -308,13 +240,27 @@ namespace videoout
 			}
 		}
 
-		char cmd[2048];
-		snprintf(cmd, sizeof(cmd),
+		char cmd[4096];
+		const int need = snprintf(cmd, sizeof(cmd),
 			"%s -hide_banner -loglevel error -y -f image2pipe -framerate %g -i -%s %s %s",
 			quoted(exe.c_str()).c_str(), fps,
 			audio.c_str(),
 			args.c_str(),
 			quoted(s_outPath).c_str());
+
+		// Truncation here is not a cosmetic problem: the OUTPUT PATH is last, so
+		// a command line that does not fit loses the destination and ffmpeg
+		// either fails or writes somewhere unintended. Preset args alone can run
+		// to 1023 characters before any of the three paths are added, so this is
+		// reachable rather than theoretical.
+		if (need < 0 || need >= (int)sizeof(cmd))
+		{
+			logger::write("info",
+				"video: encoder command line too long (%d chars, limit %d) - "
+				"shorten RenderVideoArgs or the output path. Writing frames only.",
+				need, (int)sizeof(cmd) - 1);
+			return false;
+		}
 
 		STARTUPINFOA si{};
 		si.cb         = sizeof(si);

@@ -362,7 +362,6 @@ struct Config
 			"RenderHighlightBoost=%g%s; keeps specular streaks bright through accumulation\n"
 			"RenderJpeg=%d%s; 0 = PNG\n"
 			"RenderQuality=%d%s; JPEG only\n"
-			"RenderChannelOrder=%d%s; 0 auto / 1 RGBA / 2 BGRA - only if red and blue swap\n"
 			"RenderHideHud=%d%s; hide the editor HUD and cursor while rendering\n"
 			"ExportCloseWhenDone=%d%s; return to the editor menus after an Export render\n"
 			"; Empty = RockstarEditorPlus\\Captures\\\n"
@@ -372,7 +371,7 @@ struct Config
 			renderShutter, "          ", renderSettleFrames, "     ",
 			renderSettleSubFrames, "  ", renderHighlight, "   ",
 			renderJpeg ? 1 : 0, "               ", renderQuality, "            ",
-			renderChannelOrder, "       ", renderHideHud ? 1 : 0, "            ",
+			renderHideHud ? 1 : 0, "            ",
 			exportCloseWhenDone ? 1 : 0, "      ",
 			renderOutputFolder.c_str());
 
@@ -495,6 +494,33 @@ struct Config
 	// capture addon, not here; this value is only passed through, so treat the
 	// two numbers as a taste setting rather than as a formula with a right
 	// answer.
+	// Which renderer drives the capture.
+	//
+	//   0 WALKING  - pause, seek to each sub-sample time, grab, average. Exact
+	//                shutter, deterministic frame times, and the simpler
+	//                failure mode: when it goes wrong you get a repeated
+	//                frame, which is obvious.
+	//
+	//   1 SLIDING  - let the clip PLAY, in slow motion, advancing to each
+	//                frame's mark and then exposing RenderSamples consecutive
+	//                presents. THE DEFAULT.
+	//
+	// Sliding exists for what walking cannot do rather than to do it better. A
+	// seeked frame is COLD: particle systems do not step, and anything with
+	// temporal history - TAA, SSR reprojection, the RT accumulation on Enhanced -
+	// is reset or wrong at every single sample. Playing the clip keeps all of
+	// that coherent.
+	//
+	// RenderSamples and RenderShutter mean the same thing in both modes, and
+	// there is nothing extra to configure: the playback speed is derived from a
+	// measurement taken on the first frame.
+	//
+	// Sliding is SLOWER than walking - the world has to actually run - and its
+	// shutter is approximate, since the samples land on the instants the game
+	// presented rather than on exact midpoints. Pick it for simulation fidelity,
+	// not for picture quality.
+	int   renderCaptureMode  = 1;
+
 	float renderFps          = 30.0f;
 	int   renderSamples      = 64;
 	float renderShutter      = 1.0f;
@@ -702,6 +728,23 @@ struct Config
 			char d[1024]{};
 			GetPrivateProfileStringA("RockstarEditorPlus", key, def, d, sizeof(d), ini.c_str());
 			GetPrivateProfileStringA("Render", key, d, out, n, rini.c_str());
+
+			// Cut an inline comment off the value.
+			//
+			// GetPrivateProfileString does NOT strip these - a line reading
+			//     RenderCaptureMode=Sliding   ; Walking = ...
+			// hands back the whole tail, so a comparison against "Sliding"
+			// fails and the setting silently reads as its default. That cost a
+			// full render: the ini said Sliding, the renderer ran Walking, and
+			// nothing anywhere said otherwise.
+			//
+			// The ini header warns about this and the shipped file avoids it by
+			// writing string keys bare. That is not enough - these files are
+			// hand-edited, and a user adding a comment should not silently lose
+			// the setting. Handled HERE so it cannot happen again on any key.
+			if (char* semi = strchr(out, ';')) *semi = '\0';
+			for (size_t i = strlen(out); i > 0 && (out[i-1] == ' ' || out[i-1] == '\t'); --i)
+				out[i-1] = '\0';
 		};
 
 		auto getBool = [&](const char* key, bool def) {
@@ -770,7 +813,6 @@ struct Config
 		renderJpeg         = rBool("RenderJpeg", renderJpeg);
 		renderQuality      = rInt("RenderQuality", renderQuality);
 		renderHighlight    = rFloat("RenderHighlightBoost", renderHighlight);
-		renderChannelOrder = rInt("RenderChannelOrder", renderChannelOrder);
 		renderHideHud         = rBool("RenderHideHud", renderHideHud);
 		// Both of these were renamed. Read the OLD key first so an existing
 		// Render.ini keeps its meaning, then let the new one override if it is
@@ -796,6 +838,18 @@ struct Config
 				renderMode = (_stricmp(m, "Video") == 0 || _stricmp(m, "MP4") == 0)
 					? RenderMode::Video : RenderMode::Frames;
 			}
+		}
+
+		{
+			char m[32]{};
+			rStr("RenderCaptureMode", "", m, sizeof(m));
+			// Same tolerance as RenderMode above: hand-edited, so accept the
+			// obvious spellings rather than silently falling back to the default,
+			// which is indistinguishable from the setting having worked.
+			if (m[0])
+				renderCaptureMode = (_stricmp(m, "Sliding") == 0 ||
+				                     _stricmp(m, "Slide")   == 0 ||
+				                     _stricmp(m, "Play")    == 0) ? 1 : 0;
 		}
 
 		renderKeepFrames      = rBool("RenderKeepFrames", renderKeepFrames);
