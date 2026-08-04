@@ -2061,11 +2061,24 @@ namespace gsig
 	// ours. See exportmenu.cpp; the gate is "the editor menu currently has a
 	// parsed XML", which is false during ordinary gameplay.
 	// -------------------------------------------------------------------------
+	//
+	// THE TLS SLOT OFFSET IS WILDCARDED, and that is not cosmetic. These three
+	// signatures all reach the game's TLS block by immediate - `mov edx,0x22B4`
+	// on the Steam Legacy build, `mov edx,0xB4` on the one FiveM runs (b3258).
+	// The offset is part of the game's own TLS layout and moves between game
+	// versions, so baking it in made the pattern build-specific for no benefit:
+	// it contributes nothing to uniqueness that the surrounding fifteen bytes of
+	// gs:[0x58] / indexed load / vtable call do not already provide.
+	//
+	// That is exactly how this was found - CText::Get, MemAlloc and MemFree were
+	// the ONLY three signatures to fail on FiveM, and the only three containing
+	// a TLS offset. Wildcarding it resolves all three on both builds, verified by
+	// scanning a pe-sieve dump of each.
 	inline constexpr Sig VEMENU_TEXTGET = {
 		"48 83 EC 28 E8 ? ? ? ? 48 85 C0 75 ? 8B 05 ? ? ? ? "
-		"65 48 8B 0C 25 58 00 00 00 48 8B 04 C1 80 B8 38 06 00 00 00 75 05 E8",
+		"65 48 8B 0C 25 58 00 00 00 48 8B 04 C1 80 B8 ? ? 00 00 00 75 05 E8",
 		"48 83 EC 28 E8 ? ? ? ? 48 85 C0 75 ? 8B 0D ? ? ? ? "
-		"65 48 8B 04 25 58 00 00 00 BA B4 22 00 00 48 8B 04 C8 8B 0C 02 D1 E9 80 E1 01"
+		"65 48 8B 04 25 58 00 00 00 BA ? ? 00 00 48 8B 04 C8 8B 0C 02 D1 E9 80 E1 01"
 	};
 
 	// -------------------------------------------------------------------------
@@ -2106,15 +2119,15 @@ namespace gsig
 	inline constexpr Sig VEMENU_MEMALLOC = {
 		"48 39 D1 48 0F 46 CA 45 31 C0 45 31 C9 E9",
 		"44 8B 05 ? ? ? ? 65 48 8B 04 25 58 00 00 00 4C 8B D1 4A 8B 04 C0 "
-		"4C 8B C2 B9 B8 22 00 00 48 8B 0C 01 45 33 C9 49 8B D2 48 8B 01 48 FF 60 40 "
-		"? ? ? ? ? ? ? ? 48 83 EC 28 4C 8B C1 48 85 C9 74 25"
+		"4C 8B C2 B9 ? ? 00 00 48 8B 0C 01 45 33 C9 49 8B D2 48 8B 01 48 FF 60 40 "
+		"? ? ? ? ? ? ? ? 48 83 EC 28 4C 8B C1 48 85 C9 74 ?"
 	};
 
 	inline constexpr Sig VEMENU_MEMFREE = {
-		"56 48 83 EC 20 48 85 C9 74 50 48 89 CE 8B 05 ? ? ? ? "
-		"65 48 8B 0C 25 58 00 00 00 48 8B 04 C1 80 B8 38 06 00 00 00 75 05 E8",
-		"48 83 EC 28 4C 8B C1 48 85 C9 74 25 8B 15 ? ? ? ? "
-		"65 48 8B 04 25 58 00 00 00 B9 B8 22 00 00 48 8B 04 D0 49 8B D0 "
+		"56 48 83 EC 20 48 85 C9 74 ? 48 89 CE 8B 05 ? ? ? ? "
+		"65 48 8B 0C 25 58 00 00 00 48 8B 04 C1 80 B8 ? ? 00 00 00 75 05 E8",
+		"48 83 EC 28 4C 8B C1 48 85 C9 74 ? 8B 15 ? ? ? ? "
+		"65 48 8B 04 25 58 00 00 00 B9 ? ? 00 00 48 8B 04 D0 49 8B D0 "
 		"48 8B 0C 01 48 8B 01 FF 50 50"
 	};
 

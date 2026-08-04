@@ -35,15 +35,52 @@ static void InstallResolved()
 	exportmenu::install();
 }
 
-static void InstallAll()
+static bool InstallAll()
 {
 	logger::write("info", "RockstarEditorPlus: init '%s' (base=%p)",
 		ExeName(), (void*)memory::base());
 
-	if (game::resolve())
+	const bool ok = game::resolve();
+	if (ok)
 		InstallResolved();
 
 	logger::write("info", "RockstarEditorPlus: ready");
+	return ok;
+}
+
+// -----------------------------------------------------------------------------
+//  One install, whichever route gets there first
+// -----------------------------------------------------------------------------
+//  Under FiveM there are now TWO routes in - ScriptHookV, and a fallback thread
+//  for the case where ScriptHookV never runs a script at all (see below). Either
+//  may arrive first, and both must not install.
+//
+//  A FAILED resolve does not count as done. The fallback runs early on purpose,
+//  so it can find the module before it is ready; latching on that attempt would
+//  leave the mod permanently dormant on a machine where waiting another second
+//  would have worked. So the claim is released again and the loser is free to
+//  retry.
+// -----------------------------------------------------------------------------
+static volatile LONG g_installBusy = 0;
+static volatile LONG g_installDone = 0;
+
+static bool InstallOnce(const char* who)
+{
+	if (InterlockedCompareExchange(&g_installDone, 0, 0) != 0) return true;
+	// Somebody else is inside InstallAll right now - do not race them into it.
+	if (InterlockedCompareExchange(&g_installBusy, 1, 0) != 0) return false;
+
+	bool ok = false;
+	if (InterlockedCompareExchange(&g_installDone, 0, 0) == 0)
+	{
+		logger::write("info", "RockstarEditorPlus: init via %s", who);
+		ok = InstallAll();
+		if (ok) InterlockedExchange(&g_installDone, 1);
+	}
+	else ok = true;
+
+	InterlockedExchange(&g_installBusy, 0);
+	return ok;
 }
 
 // Deferred init trampoline (same approach as fxReloader): DllMain cannot safely
@@ -62,7 +99,11 @@ static void HookGetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
 		}
 		else
 		{
-			InstallAll();
+			// Through the same guard as the FiveM routes. This path cannot race
+			// anything - it is the only one on Legacy and Enhanced - but going
+			// around the latch would leave two ways to install and only one of
+			// them recording that it had.
+			InstallOnce("the kernel32 trampoline");
 		}
 	}
 	origGetSystemTimeAsFileTime(lpSystemTimeAsFileTime);
@@ -386,7 +427,7 @@ static void ScriptThreadMain()
 {
 	logger::write("info", "RockstarEditorPlus: [FiveM] ScriptHookV thread entered");
 
-	InstallAll();
+	InstallOnce("ScriptHookV");
 
 	// Registered scripts are expected not to return; ScriptHookV re-enters one
 	// that does. Nothing here needs a tick, so park it on the longest wait
@@ -414,6 +455,60 @@ static void ScriptThreadMain()
 // thread now only ever calls WinAPI: no CRT statics, nothing to fault on.
 static HMODULE g_selfModule = nullptr;
 
+// -----------------------------------------------------------------------------
+//  FiveM fallback: init without ScriptHookV ever running a script
+// -----------------------------------------------------------------------------
+//  scriptRegister only gets you a thread once ScriptHookV actually SCHEDULES
+//  scripts, and it does not do that until the game is in a session. FiveM lets
+//  you go straight from its own menu into the Rockstar Editor without ever
+//  starting one - at which point the registration sits there for the whole
+//  session, nothing installs, and the log stops four lines in with no error
+//  because we are waiting on an event that is never coming. Every RE+ feature is
+//  dead in that flow, not just the export rows, and the user is given no reason.
+//
+//  Confirmed in-game: entering the editor from FiveM's menu produced no init at
+//  all; loading a clip started a session, ScriptHookV finally ticked, and
+//  everything appeared at once.
+//
+//  WHY A SECOND THREAD RATHER THAN JUST DOING IT IN THE POLLER. Running init on
+//  the DllMain-created thread was tried before and faulted inside msvcp140's
+//  static-init machinery - see the comment on FiveMRegisterThread. That note is
+//  precise about the cause: "it is THIS thread - one created inside DllMain,
+//  which the CRT is entitled not to treat as fully-formed". A thread created by
+//  an ordinary runtime CreateThread, from a thread that is already running, is
+//  not that thread and does get its per-thread CRT set up normally.
+//
+//  So this races ScriptHookV rather than replacing it. ScriptHookV remains the
+//  preferred route - it is a real game thread at a known-good moment - and wins
+//  whenever it turns up. This only covers the case where it never will.
+// -----------------------------------------------------------------------------
+static DWORD WINAPI FiveMFallbackInitThread(LPVOID)
+{
+	// Let the process settle before the first attempt. Nothing here is urgent:
+	// if ScriptHookV is going to run, it usually beats this anyway, and losing
+	// the race costs nothing but a log line.
+	Sleep(5000);
+
+	// ~2 minutes of attempts. Retries only matter while resolve is still
+	// failing, which on a slow or heavily-modded start means the module is not
+	// finished coming up rather than that the signatures are wrong.
+	for (int attempt = 0; attempt < 60; ++attempt)
+	{
+		if (InterlockedCompareExchange(&g_installDone, 0, 0) != 0)
+			return 0;   // ScriptHookV got there first, which is the better route
+
+		if (InstallOnce("the FiveM fallback thread (no ScriptHookV script ran)"))
+			return 0;
+
+		Sleep(2000);
+	}
+
+	logger::write("info",
+		"RockstarEditorPlus: [FiveM] fallback init gave up after ~2 minutes - "
+		"signatures never resolved. The mod is dormant this session.");
+	return 0;
+}
+
 static DWORD WINAPI FiveMRegisterThread(LPVOID)
 {
 	// Before anything else, and before the wait below burns the only early
@@ -426,6 +521,16 @@ static DWORD WINAPI FiveMRegisterThread(LPVOID)
 			"RockstarEditorPlus: [FiveM] replay heap widen faulted - ignoring, the "
 			"pool stays at stock");
 	}
+
+	// Start the fallback BEFORE the poll below, and from here rather than from
+	// DllMain - this thread is already running, so the one it creates gets a
+	// normally-initialised CRT. See FiveMFallbackInitThread.
+	if (HANDLE fb = CreateThread(nullptr, 0, FiveMFallbackInitThread, nullptr, 0, nullptr))
+		CloseHandle(fb);
+	else
+		logger::write("info",
+			"RockstarEditorPlus: [FiveM] fallback init thread could not be created (%lu) - "
+			"init depends on ScriptHookV scheduling a script", GetLastError());
 
 	// A thread is still wanted, but only for WAITING. scripthookv may not be
 	// loaded yet at DLL_PROCESS_ATTACH, and LoadLibrary from DllMain is not an

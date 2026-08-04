@@ -189,6 +189,10 @@ namespace exportmenu
 		// "Audio". The menu index is unambiguous, so it replaces the scan.
 		int g_building = -1;
 
+		// Guards the lazy injection in hkBuildMenu against re-entry. inject()
+		// issues no menu calls today, so this is insurance rather than a fix.
+		bool s_injecting = false;
+
 		// --- ms_MenuArray accessors -------------------------------------------
 		//
 		// Every one of these re-reads the live array rather than caching it. The
@@ -723,6 +727,43 @@ namespace exportmenu
 		// =====================================================================
 		//  Injection
 		// =====================================================================
+
+		// Are our rows in the live array right now?
+		//
+		// Scans for the export menu by MenuId rather than going through
+		// g_inj.menuIndex, because the lazy path below has to answer this BEFORE
+		// anything has been injected - when that index is still -1.
+		//
+		// Answers TRUE for "nothing to do" as well as "already there": no menu
+		// data, no export menu in it, no option array. The caller only uses this
+		// to decide whether to attempt an injection, and none of those states is
+		// one to attempt in.
+		bool rowsPresentInArray()
+		{
+			unsigned char* items = menuItems();
+			const int n = menuItemCount();
+			if (!items || n <= 0 || n > 512) return true;
+
+			for (int i = 0; i < n; ++i)
+			{
+				unsigned char* it = items + (size_t)i * gsig::VEMENU_ITEM_STRIDE;
+				if (*(unsigned*)(it + gsig::VEMI_MENUID) != gsig::VEMENU_EXPORT_SETTINGS)
+					continue;
+
+				unsigned char* data = *(unsigned char**)(it + gsig::VEMI_OPTIONS);
+				const int count = *(unsigned short*)(it + gsig::VEMI_OPTIONS + 8);
+				if (!data) return true;
+
+				for (int k = 0; k < count; ++k)
+					if (rowForHash(*(unsigned*)(data + (size_t)k * gsig::VEMENU_OPT_STRIDE
+					                            + gsig::VEMO_TOGGLEVALUE)) >= 0)
+						return true;
+
+				return false;   // found the menu, and none of the rows are ours
+			}
+			return true;        // no export menu in this data
+		}
+
 		void inject()
 		{
 			// Reset FIRST. Everything below reads through g_inj.menuIndex, and a
@@ -1036,6 +1077,31 @@ namespace exportmenu
 
 		int __fastcall hkBuildMenu(unsigned index, char branches, unsigned startColumn)
 		{
+			// LAZY INJECTION, and it is not a belt-and-braces addition - it is
+			// the only path that works under FiveM.
+			//
+			// Hooking Open() alone assumes we are installed before the editor
+			// menu is opened. On FiveM we are not: init defers to ScriptHookV and
+			// lands 20-90 seconds after attach, by which time the user can easily
+			// be sitting in the editor with a project loaded. Open() then fired
+			// long before our hook existed, we never saw it, and the rows would
+			// not appear until the whole menu was closed and reopened - which
+			// nobody would think to do, because nothing says so.
+			//
+			// Here instead of at the top of Open because this is the last moment
+			// before the option array is read, and it runs for every menu, so it
+			// catches the case whatever the user was looking at when we arrived.
+			//
+			// BEFORE the original, deliberately: injecting mid-iteration would
+			// swap the array the loop is walking. Before it starts, the loop
+			// simply reads the new one.
+			if (!s_injecting && menuItemCount() != 0 && !rowsPresentInArray())
+			{
+				s_injecting = true;
+				inject();
+				s_injecting = false;
+			}
+
 			const int prev = g_building;
 			g_building = (int)index;
 			const int r = origBuildMenu(index, branches, startColumn);
