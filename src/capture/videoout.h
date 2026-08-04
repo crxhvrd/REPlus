@@ -39,6 +39,18 @@ namespace videoout
 	// ffmpeg was found). Cheap; safe to call every frame.
 	bool active();
 
+	// The container the next encode will actually produce, without the dot -
+	// "mp4", "mkv", "mov".
+	//
+	// NOT simply Config::renderVideoExt: a named RenderVideoPreset supplies its
+	// own extension and overrides it, so the ini key is only the answer when no
+	// preset is in play. Anything that DISPLAYS the output format has to ask
+	// here, or it will confidently say mp4 over a render producing mkv.
+	//
+	// Reads the preset file, so it is not free - fine for a menu row, not for a
+	// per-frame path.
+	const char* outputExtension();
+
 	// Starts ffmpeg for a render. `folder` is the render's output directory,
 	// used to place the video beside the frames. Returns false and logs if
 	// ffmpeg could not be started - the caller carries on writing frames, so a

@@ -44,7 +44,7 @@ Enhanced (`GTA5_Enhanced.exe`), singleplayer and FiveM, one build.
 | GTA V | Legacy or Enhanced. Singleplayer or FiveM |
 | ASI loader | any |
 | ReShade | **rendering and DOF only**, must be the build **with full add-on support** |
-| `IgcsConnector.addon64` | bundled — capture bridge, rendering and DOF only |
+| `IgcsConnector.addon64` | **the bundled copy** — capture bridge, rendering and DOF only |
 | `ffmpeg.exe` | bundled — video output only |
 
 Camera and shake need only the ASI loader.
@@ -53,6 +53,15 @@ ReShade is required for rendering because an ASI cannot read the GPU frame
 buffer; the add-on does that. The ordinary ReShade build cannot load add-ons at
 all — `IgcsConnector.addon64` is then ignored and Export falls back to the game's
 watermarked encoder with no indication why. ReShade itself is not bundled.
+
+**Use the bundled `IgcsConnector.addon64`, not one from anywhere else.** It is a
+modified build carrying the shared-memory capture channel this mod drives; a
+stock IGCS Connector has no such channel, so it will load, present happily, and
+never capture a frame.
+
+The **Rockstar Editor+** row on the Export screen states both requirements and
+tells you which one is currently unmet — no ReShade, the wrong ReShade build, or
+the right build with an add-on that is not presenting.
 
 ### FiveM
 
@@ -99,9 +108,20 @@ All settings are in the editor. Open a marker's menu and find the
 |---|---|
 | Top-level marker menu | pages through global settings: **Curve**, **Limits**, **Scene** |
 | Camera submenu | group switcher: Spline, Shake, Shake Motion, 4 advanced pages |
+| **Export screen** | the renderer's own settings, under the stock Frame Rate and Bit rate |
 
 Pages rather than one long list because the editor's Scaleform column draws 16
 rows and silently discards the rest.
+
+The Export screen carries nine extra rows — **Rockstar Editor+**, then Output,
+Frame Rate, Capture Mode, Motion Blur, Shutter, Highlight Boost, Audio and Colour
+Channels. Turning the renderer
+on greys out the game's own Frame Rate and Bit rate, which configure an encoder
+that will not run; turning it off greys ours instead. Either way the panel on the
+right explains the highlighted row, including a greyed one — so the game's own
+Frame Rate says that the export has been handed over rather than just sitting
+there dead. Everything there is the same setting as the matching key in
+`Render.ini`, and a change made in the menu is written straight back to it.
 
 **Adjust Step** sets the increment for left/right, 0.001 to 1. Changes save
 automatically — global to the ini, per-marker to a side-car file.
@@ -379,7 +399,8 @@ every clip in the project.
 
 Triggered by **Export**. Nothing else starts it.
 
-**Ships off** — set `EnableRenderer=1` in `Render.ini`. It is opt-in because it
+**Ships off** — switch it on with the **Rockstar Editor+** row on the Export
+screen, or set `EnableRenderer=1` in `Render.ini`. It is opt-in because it
 is the one feature that cannot coexist: diverting the bake means other export
 tools (EVE, EVER) never fire. They do not error, they silently never run.
 Everything else the mod does is additive.
@@ -388,7 +409,9 @@ Everything else the mod does is additive.
 and deletes them, so a long render costs a couple of files at a time rather than
 thousands; project audio is recorded and muxed from the same Export press.
 `RenderMode=Frames` writes a numbered PNG/JPEG sequence with an `assemble.txt`
-of ready-made ffmpeg command lines, and no audio.
+of ready-made ffmpeg command lines. Audio works here too — it lands as
+`audio.wav` beside the frames and `assemble.txt` carries the arguments that mux
+it onto whichever conform you pick.
 
 The capture is identical either way. Codecs come from `presets\` — `h264`,
 `h265`, `nvenc_hevc`, `prores_hq`, `lossless` — selected with
@@ -403,16 +426,19 @@ up. `RenderShutter=0.5` is the 180° film convention.
 
 **Audio** — `RenderAudio=1` (default). One Export press does two passes: the
 project plays through once at normal speed to record sound, then rewinds to clip
-one and renders frames. Muxed at the end. Requires `RenderMode=Video`.
-Alternatively point `AudioFromFile` at a stock export of the same project.
+one and renders frames. In `Video` mode it is muxed at the end; in `Frames` mode
+it is left as `audio.wav` next to the sequence and `assemble.txt` tells you how
+to attach it. Alternatively point `AudioFromFile` at a stock export of the same
+project.
 
 **Duration** — rendering seeks frame by frame and is far slower than real time.
 Progress and an estimate go to the log every 15 seconds.
 
 ### Capture modes
 
-`RenderCaptureMode` in `Render.ini`. Both average `RenderSamples` real renders
-into every output frame — the difference is what the world does between them.
+The **Capture Mode** row on the Export screen, or `RenderCaptureMode` in
+`Render.ini`. Both average `RenderSamples` real renders into every output frame —
+the difference is what the world does between them.
 
 | | Sliding *(default)* | Walking |
 |---|---|---|
@@ -448,13 +474,32 @@ Started from **ReShade's own overlay**, the IgcsConnector depth-of-field panel.
 There is no switch in the editor. Requires:
 
 - the editor open, on a free-camera marker
-- **playback paused** — a session integrates one instant
+- **playback paused** — the session drives the clock itself
 - `IgcsDof.fx` in the ReShade shaders folder (bundled)
 
-For static shots, and there is nothing to configure. The replay clock never
-moves during a session, so every sample sees the same instant from a different
-point on the lens. Motion blur belongs to the renderer, where the shutter is
-exact and does not compete for a sample budget.
+**Shutter (ms)** in that panel decides what a session integrates. At **0** it is
+one frozen instant: every sample is the same moment from a different point on
+the lens, so only the aperture varies. That is the default and the right answer
+for a locked-off shot.
+
+Above 0 the replay clock steps per sample as well, and one pass gives depth of
+field **and** motion blur — 16.7 ms is a 1/60s exposure, 33.3 ms a 1/30s one. It
+costs no extra samples, so a long shutter over few samples is what discrete
+ghosting looks like; raise quality alongside it.
+
+The camera is not pinned while the clock moves, so a shot riding a spline blurs
+along its path as a whole. Only the aperture's parallax is cancelled before each
+sample is summed — the aperture is the lens, the spline is the camera body, and
+only the first should leave the focus plane sharp.
+
+Sample times are spread evenly across the exposure and then shuffled against the
+aperture order. Both halves matter: an uneven spread beads the smear into
+separate ghosts, and time that tracks aperture radius makes a moving subject
+sweep radially — tight bokeh at one end of the trail, wide at the other.
+
+> The slider only appears when the connected camera tools can step a clock,
+> which outside this mod is essentially never — so on any other game the panel
+> looks exactly as it did.
 
 ---
 
@@ -503,10 +548,15 @@ Both files live in `RockstarEditorPlus\`, beside the `.asi`.
 
 ### `Render.ini`
 
+The seven rows on the editor's Export screen write straight into this file, so
+the two are never out of step — the menu is the same settings with descriptions
+attached. The keys below that have no row are the ones you set once.
+
 | Key | Default | |
 |---|---|---|
 | `EnableRenderer` | 0 | master switch; 0 restores the stock exporter |
 | `RenderMode` | Video | `Video` or `Frames` |
+| `RenderCaptureMode` | Sliding | `Sliding` or `Walking` — see Capture modes above |
 | `RenderFps` | 30 | output rate |
 | `RenderSamples` | 64 | motion-blur samples; 1 = none |
 | `RenderShutter` | 1 | shutter angle; 0.5 = 180° |
@@ -563,7 +613,7 @@ you can change it. Delete the ini to have a current one written.
 | Symptom | Cause |
 |---|---|
 | Export gives a normal watermarked video | Capture add-on not found — the mod stepped aside rather than produce the wrong thing. Either ReShade was installed without add-on support, or `IgcsConnector.addon64` is not beside the executable. The log names which |
-| Red and blue swapped | Set `RenderChannelOrder` to 1 or 2 |
+| Colours wrong in the render, fine on screen | **Colour Channels** on the Export screen, or `RenderChannelOrder` — try 1, then 2. Auto is known to mis-detect on Legacy, FiveM especially. Fixed in this build: the key was never read, so it stayed on Auto whatever you set |
 | Got frames, expected video | `RenderMode=Frames`, or ffmpeg not found — the log says which |
 | A shake setting does nothing | Per-marker values override the ini and always win. If the menu shows a number rather than `Default`, that marker has its own. `ShakeDebugLog=1` logs what reached the camera |
 | Shake looks frozen | The playhead is paused. Play or scrub |

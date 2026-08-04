@@ -214,6 +214,35 @@ namespace game
 	// True when every menu address above resolved.
 	bool menuReady();
 
+	// --- Video Editor EXPORT menu (CVideoEditorMenu, the data-driven one) ---
+	//
+	// A different screen and a different mechanism from the marker menu above:
+	// this one is built from ms_MenuArray, parsed out of VideoEditorMenu.XML, so
+	// rows are ADDED TO DATA rather than injected into a populate. See the
+	// VEMENU_ block in signatures.h.
+	//
+	// All 0 when the feature failed to resolve, in which case the export screen
+	// is left exactly as shipped.
+	extern uintptr_t addr_VEMenuOpen;          // CVideoEditorMenu::Open()
+	extern uintptr_t addr_VEAdjustToggle;      // void(s32 dir, atHashString const&)
+	extern uintptr_t addr_VEGetToggleString;   // const char*(atHashString const&, atHashString const&)
+	extern uintptr_t addr_VEIsItemSelectable;  // bool(s32 menuId, s32 column, s32 index)
+	extern uintptr_t addr_VEBuildMenu;         // s32(s32 index, bool branches, s32 startColumn)
+	extern uintptr_t addr_TextGet;             // const char* CText::Get(u32 hash, const char* dbg)
+	extern uintptr_t addr_g_VEMenuArray;       // CVideoEditorMenuArray (atArray at +0)
+	extern uintptr_t addr_g_VECurrentColumn;   // s32  ms_iCurrentColumn
+	extern uintptr_t addr_g_VEMenuIdForColumn; // s32[3] ms_iMenuIdForColumn
+	extern uintptr_t addr_g_VECurrentItem;     // s32[3] ms_iCurrentItem
+
+	// rage::sysMemAllocator::GetCurrent() Allocate / Free. The game's own heap,
+	// which is the only one the option array may come from - atArray::Reset()
+	// frees it through the same allocator on the next Close().
+	extern uintptr_t addr_MemAlloc;            // void*(u64 size, u64 align)
+	extern uintptr_t addr_MemFree;             // void(void*)
+
+	// True when every export-menu address above resolved.
+	bool exportMenuReady();
+
 	// Index of the marker the editor currently has open. Enhanced needs it
 	// because GetCurrentEditMarker is inlined there and menu.cpp walks the clip
 	// array by hand; Legacy leaves it 0 and calls GetCurrentEditMarker instead.

@@ -21,6 +21,7 @@
 #include "replay/limits.h"
 #include "replay/scene.h"
 #include "ui/menu.h"
+#include "ui/exportmenu.h"
 
 inline const char* ExeName()
 {

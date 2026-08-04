@@ -157,6 +157,39 @@ namespace videoout
 		return s_started && s_stdin != nullptr;
 	}
 
+	// The same resolution begin() performs, without starting anything: a named
+	// preset's Ext wins over RenderVideoExt.
+	//
+	// Deliberately reuses loadPreset() rather than re-reading the preset file
+	// with its own copy of the section and key names - a display that agreed
+	// with the encoder only until someone renamed a key would be worse than no
+	// display at all.
+	//
+	// loadPreset logs when a preset is named but unusable, which would turn a
+	// menu row into a log spammer, so a missing preset is resolved quietly here
+	// by asking whether the file exists first.
+	const char* outputExtension()
+	{
+		static std::string s_ext;
+		const Config& cfg = Config::get();
+
+		s_ext = cfg.renderVideoExt.empty() ? "mp4" : cfg.renderVideoExt;
+
+		if (!cfg.renderVideoPreset.empty())
+		{
+			const std::string path =
+				paths::sub("presets") + cfg.renderVideoPreset + ".ini";
+			if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				char e[64]{};
+				GetPrivateProfileStringA("Preset", "Ext", s_ext.c_str(),
+				                         e, sizeof(e), path.c_str());
+				if (e[0]) s_ext = e;
+			}
+		}
+		return s_ext.c_str();
+	}
+
 	std::string s_audioOverride;
 	void setAudio(const char* path) { s_audioOverride = path ? path : ""; }
 

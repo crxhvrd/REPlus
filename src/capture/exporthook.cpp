@@ -115,11 +115,17 @@ namespace exporthook
 					// distinguishes those without a second round trip.
 					logger::write("info",
 						"export: capture addon not usable - leaving the game's own export "
-						"alone. channel=%s heartbeat=%u. If IgcsConnector.addon64 is present, "
-						"it is loaded but never presenting: check ReShade has add-on support, "
-						"that IgcsDOF is enabled, and that nothing else (ENB) owns present.",
+						"alone. channel=%s heartbeat=%u reshade=%s. Rendering needs ReShade "
+						"WITH FULL ADD-ON SUPPORT plus the IgcsConnector.addon64 BUNDLED "
+						"WITH THIS MOD - any other IgcsConnector lacks the capture channel "
+						"and will present happily without ever grabbing a frame. If both are "
+						"right, check the add-on is enabled and that nothing else (ENB) owns "
+						"present.",
 						fxcapture::available() ? "mapped" : "NOT MAPPED",
-						fxcapture::heartbeat());
+						fxcapture::heartbeat(),
+						fxcapture::hostState() == fxcapture::HOST_ADDONS   ? "with add-ons"
+						: fxcapture::hostState() == fxcapture::HOST_NO_ADDONS ? "ORDINARY BUILD"
+						                                                     : "NOT LOADED");
 				}
 			}
 

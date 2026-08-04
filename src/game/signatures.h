@@ -1846,4 +1846,323 @@ namespace gsig
 	inline constexpr int WEATHER_NEWTYPE_OFF = 0x10;
 	inline constexpr int WEATHER_INTERP_OFF  = 0x14;
 	inline constexpr int WEATHER_WETNESS_OFF = 0x20;
+
+	// =========================================================================
+	//  The Video Editor's own menu (CVideoEditorMenu) — the EXPORT screen
+	// =========================================================================
+	//  A COMPLETELY different mechanism from the marker menu in menu.cpp, and
+	//  the difference is the whole reason this feature is cheap.
+	//
+	//  CVideoEditorPlayback builds its columns in CODE, one Scaleform call at a
+	//  time, so rows can only be added by slipping calls in mid-populate and
+	//  then owning input, focus and help text ourselves.
+	//
+	//  CVideoEditorMenu is DATA-DRIVEN. Open() parses
+	//  `common:/data/ui/VideoEditorMenu.XML` into ms_MenuArray, and every other
+	//  part of the screen — the item loop in BuildMenu, the focus walk in
+	//  GoToItem, the left/right dispatch in ActionInputLeft/Right, the greying
+	//  pass, the accept handler — indexes that array. So a row appended to the
+	//  array IS a row of the menu, with no further cooperation required.
+	//
+	//  That is why exporthook.cpp says diverting one Open() argument avoided
+	//  "the risk that comes with appending rows to R*'s data-driven export
+	//  menu". The risk turned out to be one thing only: the option array is
+	//  freed with the game's allocator, so it has to be GROWN with the game's
+	//  allocator. Everything else is stock behaviour.
+	//
+	//  Four hooks and one array edit:
+	//    Open              — inject, right after the XML is parsed
+	//    AdjustToggleValue — left/right on one of our rows
+	//    GetToggleString   — the value text of one of our rows
+	//    CText::Get        — the LABEL text, which the game reads from the
+	//                        string table by hash and ours are not in it
+	//
+	//  Struct layouts below are the retail ones, read out of the decompile and
+	//  confirmed identical on both builds.
+	// -------------------------------------------------------------------------
+
+	// atStringHash("EXPORT_SETTINGS"), the menu id the export screen is parsed
+	// under. Verified by reimplementing atStringHash (Jenkins one-at-a-time over
+	// the lowercased string) and checking it against toggle hashes that appear as
+	// literal immediates in the decompiled menu code - TOGGLE_EXPORT_FPS
+	// 0x8A8E3B0C and TOGGLE_EXPORT_QUALITY 0x24866C43 both reproduce exactly.
+	inline constexpr unsigned VEMENU_EXPORT_SETTINGS = 0x65DD979D;
+
+	// CVideoEditorMenuItem, 0x38 bytes. Stride confirmed by the `idx * 0x38`
+	// scaling in IsItemSelectable and BuildMenu on both builds.
+	inline constexpr int VEMENU_ITEM_STRIDE     = 0x38;
+	inline constexpr int VEMI_MENUID            = 0x00;  // atHashString
+	inline constexpr int VEMI_COLUMNID          = 0x04;  // eCOL_NUM
+	inline constexpr int VEMI_COLUMNTYPE        = 0x08;  // eCOL_TYPE
+	inline constexpr int VEMI_COLUMNDATATYPE    = 0x0C;  // eCOL_DATA_TYPE
+	inline constexpr int VEMI_OPTIONS           = 0x18;  // atArray<Option>
+	inline constexpr int VEMI_CONTENT           = 0x28;  // CVideoEditorMenuBasicPage*
+
+	// CVideoEditorMenuOption, 0x28 bytes = ten consecutive atHashStrings.
+	//
+	// Three are pinned directly by the decompile - Context at +4, ToggleValue at
+	// +0x18 and UniqueId at +0x24, each read at a 0x28 stride. The stride and
+	// those three fixed points leave the remaining seven as the only consistent
+	// filling of a ten-slot run, and each was then confirmed at its use site:
+	// cTextId at +0 is what BuildMenu hands to CText::Get, LinkMenuId at +0xC is
+	// what selects the next column, TriggerAction at +0x14 is what the accept
+	// path dispatches on.
+	inline constexpr int VEMENU_OPT_STRIDE      = 0x28;
+	inline constexpr int VEMO_TEXTID            = 0x00;
+	inline constexpr int VEMO_CONTEXT           = 0x04;
+	inline constexpr int VEMO_BLOCK             = 0x08;
+	inline constexpr int VEMO_LINKMENUID        = 0x0C;
+	inline constexpr int VEMO_JUMPMENUID        = 0x10;
+	inline constexpr int VEMO_TRIGGERACTION     = 0x14;
+	inline constexpr int VEMO_TOGGLEVALUE       = 0x18;
+	inline constexpr int VEMO_WARNINGTEXT       = 0x1C;
+	inline constexpr int VEMO_DEPENDENTACTION   = 0x20;
+	inline constexpr int VEMO_UNIQUEID          = 0x24;
+
+	// CVideoEditorMenuBasicPage — the right-hand description panel.
+	inline constexpr int VEMBP_HEADER           = 0x00;
+	inline constexpr int VEMBP_BODY             = 0x04;
+
+	// eCOL_TYPE / eCOL_DATA_TYPE, the two values we require before touching a
+	// menu item. Anything else is not a plain option list.
+	inline constexpr int VEMENU_COL_TYPE_LIST      = 0;
+	inline constexpr int VEMENU_COL_DATA_STANDARD  = 0;
+
+	// The column renders sixteen items and SCROLLS beyond that, unlike the
+	// playback column - which draws sixteen and silently discards the rest. So
+	// there is no hard cap to design around here, but a menu that scrolls is
+	// still worse than one that does not; keep the total near this.
+	inline constexpr int VEMENU_ITEMS_VISIBLE   = 16;
+
+	// -------------------------------------------------------------------------
+	// CVideoEditorMenu::Open()   leg RVA 0x19653C, enh RVA 0x63D7E0
+	//
+	// Called once each time the editor's menu screen opens, and it re-parses the
+	// XML every time - Close() Reset()s the array - so our rows have to be put
+	// back on every one of these. Hooking it is the only injection point that is
+	// guaranteed to run before anything reads the array.
+	//
+	// Both patterns are the prologue plus the first few zeroing stores; each is
+	// already unique in its binary before the wildcards.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig VEMENU_OPEN = {
+		"56 57 53 48 83 EC 60 0F 29 74 24 50 48 C7 05 ? ? ? ? 00 00 00 00 "
+		"C7 05 ? ? ? ? 00 00 00 00 48 C7 05 ? ? ? ? 00 00 00 00 C6 05",
+		"48 89 5C 24 18 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 83 EC 40 "
+		"45 33 FF 48 8D 1D ? ? ? ? 4C 8D 25 ? ? ? ? 4C 89 3D"
+	};
+
+	// -------------------------------------------------------------------------
+	// CVideoEditorMenu::AdjustToggleValue(s32 direction, atHashString const&)
+	//                                     leg RVA 0x15CE38, enh RVA 0x64EE50
+	//
+	// THE anchor of this whole feature. It is a flat if-chain over the toggle
+	// hashes, so the TOGGLE_EXPORT_FPS immediate 0x8A8E3B0C picks it out of the
+	// binary in one byte search - and its prologue hands over four more things
+	// we would otherwise have to hunt separately:
+	//
+	//     ms_iCurrentColumn / ms_iMenuIdForColumn[] / ms_iCurrentItem[]
+	//     IsItemSelectable
+	//
+	// Note what the two builds do with the array bases. MSVC materialises the
+	// image base into r14 and encodes each array as an ABSOLUTE RVA in the
+	// instruction's disp32; Clang uses ordinary RIP-relative LEAs. So the two
+	// need different derive kinds, not just different offsets - see DeriveAbs.
+	//
+	//   leg:  48 8B DA              mov  rbx,rdx
+	//         48 63 15 ? ? ? ?      movsxd rdx,[rip+d]         ms_iCurrentColumn
+	//         4C 8D 35 ? ? ? ?      lea  r14,[rip+d]           <- image base
+	//         45 8B 84 96 ? ? ? ?   mov  r8d,[r14+rdx*4+RVA]   ms_iCurrentItem
+	//         8B F9                 mov  edi,ecx
+	//         41 8B 8C 96 ? ? ? ?   mov  ecx,[r14+rdx*4+RVA]   ms_iMenuIdForColumn
+	//         E8 ? ? ? ?            call IsItemSelectable
+	//
+	//   enh:  48 63 15 ? ? ? ?      movsxd rdx,[rip+d]         ms_iCurrentColumn
+	//         4C 8D 35 ? ? ? ?      lea  r14,[rip+d]           ms_iMenuIdForColumn
+	//         41 8B 0C 96           mov  ecx,[r14+rdx*4]
+	//         4C 8D 3D ? ? ? ?      lea  r15,[rip+d]           ms_iCurrentItem
+	//         45 8B 04 97           mov  r8d,[r15+rdx*4]
+	//         E8 ? ? ? ?            call IsItemSelectable
+	// -------------------------------------------------------------------------
+	inline constexpr Sig VEMENU_ADJUSTTOGGLE = {
+		"41 57 41 56 56 57 55 53 48 83 EC 28 48 89 D7 89 CE 48 63 15 ? ? ? ? "
+		"4C 8D 35 ? ? ? ? 41 8B 0C 96 4C 8D 3D ? ? ? ? 45 8B 04 97 E8",
+		"48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 "
+		"48 8B DA 48 63 15 ? ? ? ? 4C 8D 35 ? ? ? ? 45 8B 84 96 ? ? ? ? "
+		"8B F9 41 8B 8C 96 ? ? ? ? E8"
+	};
+
+	// -------------------------------------------------------------------------
+	// CVideoEditorMenu::GetToggleString(atHashString const&, atHashString const&)
+	//                                   leg RVA 0x17F7FC, enh RVA 0x656D00
+	//
+	// Returns a pointer to its own static cReturnText[100], and NULL for a hash
+	// it does not know - which is exactly what an un-hooked build would hand
+	// BuildMenu for our rows. Both prologues open by zeroing that buffer and
+	// then comparing against TOGGLE_LENGTH_SELECTION (0x6F041B3D on Legacy) or
+	// the binary-search pivot Clang chose (0xBD49FE25 on Enhanced).
+	// -------------------------------------------------------------------------
+	inline constexpr Sig VEMENU_GETTOGGLESTRING = {
+		"41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 58 48 89 D7 "
+		"C6 05 ? ? ? ? 00 8B 01 45 31 FF 3D 25 FE 49 BD 7E",
+		"48 89 5C 24 10 48 89 7C 24 18 55 48 8B EC 48 83 EC 30 "
+		"C6 05 ? ? ? ? 00 8B 01 48 8B FA 3D 3D 1B 04 6F"
+	};
+
+	// -------------------------------------------------------------------------
+	// CVideoEditorMenu::BuildMenu(s32 index, bool branches, s32 startColumn)
+	//                             leg RVA 0x15EF3C, enh RVA 0x651A80
+	//
+	// Hooked purely to know WHICH menu is being drawn while CText::Get runs.
+	//
+	// Without it the text hook can only ask "is this hash one of ours" and "is
+	// the cursor on one of our rows", and neither is sufficient. The second is
+	// the one that actually broke: ms_iMenuIdForColumn keeps a stale entry for a
+	// column after you navigate back out of the export screen, so a scan of it
+	// still answers "yes, our menu" while a completely different menu is being
+	// built - and any row sharing a text key with the export page's header then
+	// gets one of our labels stamped on it. The project menu's Export row does
+	// share that key, which is exactly how it started reading "Audio".
+	//
+	// The menu index is unambiguous and needs no heuristic, so this replaces the
+	// scan entirely. It recurses (branches build the linked column), hence the
+	// save/restore in the hook.
+	//
+	// Legacy's prologue is unique on its own. Enhanced's is eleven movaps spills
+	// of generic Clang boilerplate that matches three functions, so its pattern
+	// runs all the way to the first real instruction.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig VEMENU_BUILDMENU = {
+		"41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC 78 03 00 00 "
+		"44 0F 29 BC 24 60 03 00 00 44 0F 29 B4 24 50 03 00 00 "
+		"44 0F 29 AC 24 40 03 00 00 44 0F 29 A4 24 30 03 00 00 "
+		"44 0F 29 9C 24 20 03 00 00 44 0F 29 94 24 10 03 00 00 "
+		"44 0F 29 8C 24 00 03 00 00 44 0F 29 84 24 F0 02 00 00 "
+		"0F 29 BC 24 E0 02 00 00 0F 29 B4 24 D0 02 00 00 41 89 CD 48 8B",
+		"88 54 24 10 89 4C 24 08 55 53 56 57 48 8D AC 24 48 FE FF FF "
+		"48 81 EC B8 02 00 00 83 4C 24 50 FF 8B F9 44 8A CA 48 8B 15"
+	};
+
+	// -------------------------------------------------------------------------
+	// CText::Get(u32 hash, const char* debugName)  leg RVA 0xDD55B8, enh 0x51D620
+	//
+	// The row LABEL comes from here - BuildMenu does
+	// `TheText.Get(thisItem.cTextId.GetHash(), "")` - and so does the
+	// description panel's header and body. Our keys are not in the game's text
+	// table, so without this hook our rows would draw whatever the miss path
+	// hands back.
+	//
+	// This is the outer wrapper: `r = RealGet(...); if (r) return r;` followed
+	// by the not-found path, which is what makes the shape distinctive - a bare
+	// `sub rsp,28 / call / test rax,rax / jnz` before it touches anything else.
+	//
+	// It is a HOT function - every HUD string in the game comes through it - so
+	// the hook has to answer in a couple of compares for anything that is not
+	// ours. See exportmenu.cpp; the gate is "the editor menu currently has a
+	// parsed XML", which is false during ordinary gameplay.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig VEMENU_TEXTGET = {
+		"48 83 EC 28 E8 ? ? ? ? 48 85 C0 75 ? 8B 05 ? ? ? ? "
+		"65 48 8B 0C 25 58 00 00 00 48 8B 04 C1 80 B8 38 06 00 00 00 75 05 E8",
+		"48 83 EC 28 E8 ? ? ? ? 48 85 C0 75 ? 8B 0D ? ? ? ? "
+		"65 48 8B 04 25 58 00 00 00 BA B4 22 00 00 48 8B 04 C8 8B 0C 02 D1 E9 80 E1 01"
+	};
+
+	// -------------------------------------------------------------------------
+	// rage::sysMemAllocator::GetCurrent()->Allocate / Free
+	//   alloc leg RVA 0x12E0, enh 0x18B0        free leg RVA 0x1318, enh 0x18D0
+	//
+	// The game's operator new / delete. Required because atArray::Reset() frees
+	// the option buffer through exactly these, so a CRT block handed to the
+	// game's heap on the next Close() would corrupt it - the same constraint
+	// that already governs pushMenuOption() in menu.cpp.
+	//
+	// Both are five-instruction leaf functions: read _tls_index, index the TLS
+	// slot, load the allocator at +0x22B8 and tail-call its vtable (+0x40
+	// Allocate, +0x50 Free). Enhanced's alloc is the two-argument form that
+	// sits next to the align-16 wrapper GAME_ALLOC already resolves.
+	//
+	// Called, never hooked, so their size does not matter.
+	//
+	// THE LEGACY PATTERN CARRIES THE FREE'S HEAD AS ITS TAIL, and that is not
+	// decoration. The allocate thunk exists TWICE in the Legacy image, byte for
+	// byte apart from the RIP displacement of the _tls_index load - 0x12A8 and
+	// 0x12E0, one of them with no xrefs at all, presumably a COMDAT the linker
+	// did not fold. The body alone therefore matches twice and memory::scan()
+	// takes the FIRST, which is the unreferenced one. Both are the same
+	// instructions and either would work, but "it happens to be fine" is not a
+	// thing to leave in a path that hands memory to the game's heap.
+	//
+	// Anchoring on the pair fixes it deterministically and says something true:
+	// the compiler emits new and delete together, so the allocate we want is the
+	// one immediately followed by the matching free. The eight bytes between
+	// them are alignment padding and are wildcarded.
+	//
+	// Found by scanning the module images offline with the finished patterns
+	// rather than by searching in Ghidra, which was given the literal
+	// displacement and duly reported one hit. A pattern with wildcards has to be
+	// tested WITH its wildcards.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig VEMENU_MEMALLOC = {
+		"48 39 D1 48 0F 46 CA 45 31 C0 45 31 C9 E9",
+		"44 8B 05 ? ? ? ? 65 48 8B 04 25 58 00 00 00 4C 8B D1 4A 8B 04 C0 "
+		"4C 8B C2 B9 B8 22 00 00 48 8B 0C 01 45 33 C9 49 8B D2 48 8B 01 48 FF 60 40 "
+		"? ? ? ? ? ? ? ? 48 83 EC 28 4C 8B C1 48 85 C9 74 25"
+	};
+
+	inline constexpr Sig VEMENU_MEMFREE = {
+		"56 48 83 EC 20 48 85 C9 74 50 48 89 CE 8B 05 ? ? ? ? "
+		"65 48 8B 0C 25 58 00 00 00 48 8B 04 C1 80 B8 38 06 00 00 00 75 05 E8",
+		"48 83 EC 28 4C 8B C1 48 85 C9 74 25 8B 15 ? ? ? ? "
+		"65 48 8B 04 25 58 00 00 00 B9 B8 22 00 00 48 8B 04 D0 49 8B D0 "
+		"48 8B 0C 01 48 8B 01 FF 50 50"
+	};
+
+	// A value the instruction encodes as an ABSOLUTE RVA in its disp32 rather
+	// than RIP-relative — `mov r8d,[r14+rdx*4+0x1F63EC0]`, where r14 was loaded
+	// with the image base earlier in the function. MSVC does this for indexed
+	// globals; Clang does not, which is why only the Legacy side uses it.
+	//
+	// Resolved as base + disp32, so unlike Derive there is no instruction end to
+	// account for and `extra` would be meaningless.
+	struct DeriveAbs { int insn; int disp; const unsigned char* op; int opLen; };
+
+	inline constexpr unsigned char OP_MOVSXD_RDX[] = { 0x48, 0x63, 0x15 };  // movsxd rdx,[rip+d]
+	inline constexpr unsigned char OP_LEA_R14[]    = { 0x4C, 0x8D, 0x35 };  // lea r14,[rip+d]
+	inline constexpr unsigned char OP_LEA_R15[]    = { 0x4C, 0x8D, 0x3D };  // lea r15,[rip+d]
+	// OP_MOVZX_ECX_M16 (0F B7 0D) is already declared above, with the replay
+	// block-count derives.
+	inline constexpr unsigned char OP_MOV_R8D_IDX[]= { 0x45, 0x8B, 0x84, 0x96 }; // mov r8d,[r14+rdx*4+RVA]
+	inline constexpr unsigned char OP_MOV_ECX_IDX[]= { 0x41, 0x8B, 0x8C, 0x96 }; // mov ecx,[r14+rdx*4+RVA]
+
+	// --- out of AdjustToggleValue --------------------------------------------
+	inline constexpr DerivePair ATV_CURRENTCOLUMN = {
+		{ 0x11, 0x14, OP_MOVSXD_RDX, 3, 0 },   // enh
+		{ 0x18, 0x1B, OP_MOVSXD_RDX, 3, 0 },   // leg
+	};
+	// Enhanced only — Legacy encodes both arrays as absolute RVAs instead.
+	inline constexpr Derive ATV_E_MENUIDFORCOL  = { 0x18, 0x1B, OP_LEA_R14, 3, 0 };
+	inline constexpr Derive ATV_E_CURRENTITEM   = { 0x23, 0x26, OP_LEA_R15, 3, 0 };
+	// Legacy only.
+	inline constexpr DeriveAbs ATV_L_CURRENTITEM  = { 0x26, 0x2A, OP_MOV_R8D_IDX, 4 };
+	inline constexpr DeriveAbs ATV_L_MENUIDFORCOL = { 0x30, 0x34, OP_MOV_ECX_IDX, 4 };
+
+	inline constexpr DerivePair ATV_ISITEMSELECTABLE = {
+		{ 0x2E, 0x2F, OP_CALL, 1, 0 },         // enh
+		{ 0x38, 0x39, OP_CALL, 1, 0 },         // leg
+	};
+
+	// --- out of IsItemSelectable ---------------------------------------------
+	// Its third guard is `iMenuId >= ms_MenuArray.CVideoEditorMenuItems.GetCount()`,
+	// which loads the u16 count at ms_MenuArray+8. That is the shallowest read
+	// of the array in either binary, which is why the array is derived from here
+	// rather than from Open() - where the only reference sits ~0x200 bytes in,
+	// next to the parser call.
+	//
+	// Subtract VEMENU_ARRAY_COUNT_OFF from the result to get the array itself.
+	inline constexpr DerivePair IIS_MENUARRAY_COUNT = {
+		{ 0x1C, 0x1F, OP_MOVZX_ECX_M16,  3, 0 },   // enh
+		{ 0x32, 0x35, OP_MOVZX_EAX_M16,  3, 0 },   // leg
+	};
+	inline constexpr int VEMENU_ARRAY_COUNT_OFF = 8;
 }

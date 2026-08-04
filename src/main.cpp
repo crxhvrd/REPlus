@@ -30,6 +30,9 @@ static void InstallResolved()
 	limits::install();
 	scene::install();
 	exporthook::install();
+	// After exporthook, which owns what the Export button DOES; this owns the
+	// rows on the screen that configure it.
+	exportmenu::install();
 }
 
 static void InstallAll()

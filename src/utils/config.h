@@ -372,6 +372,18 @@ struct Config
 			"; Split out of RockstarEditorPlus.ini, which now holds only the editor\n"
 			"; patches (camera, shake, limits). Values here were carried over from it.\n"
 			";\n"
+			"; The eight settings people change per shot - EnableRenderer, RenderMode,\n"
+			"; RenderCaptureMode, RenderFps, RenderSamples, RenderShutter,\n"
+			"; RenderHighlightBoost and RenderAudio - are also rows on the editor's own\n"
+			"; Export screen, under the stock Frame Rate and Bit rate. They are ONE\n"
+			"; setting with two editors, not two settings: a row writes straight back\n"
+			"; into this file, so the menu and this file can never disagree.\n"
+			";\n"
+			"; This file is read ONCE, at startup. Editing it while the game is running\n"
+			"; therefore does nothing until the next launch - use the menu for anything\n"
+			"; you want to change mid-session. Everything not listed above has no row and\n"
+			"; is set-once here.\n"
+			";\n"
 			"; EDITING NOTE: inline \"; ...\" comments are only safe on NUMBER and 0/1\n"
 			"; keys. Windows' ini API does NOT strip them, so on a PATH or STRING key\n"
 			"; the comment ends up inside the value. Those keep their comment on the\n"
@@ -392,6 +404,15 @@ struct Config
 			"; do not error, they just silently never run. Turn this on when you want\n"
 			"; RE+ to be the thing that handles Export.\n"
 			"EnableRenderer=%d\n\n"
+			"; How the sub-frames are gathered.\n"
+			";   Walking  pause and seek to each sub-frame's exact instant. Exact\n"
+			";            shutter, deterministic, faster - but a seeked frame is COLD:\n"
+			";            particles do not step and anything with temporal history\n"
+			";            (TAA, SSR, RT accumulation) is wrong at every sample.\n"
+			";   Sliding  play the clip in slow motion and expose consecutive presented\n"
+			";            frames. Keeps all of that coherent. Slower, and the shutter is\n"
+			";            approximate. Simulation fidelity over sharpness.\n"
+			"RenderCaptureMode=%s\n\n"
 			"RenderFps=%g%s; output rate, independent of your actual framerate\n"
 			"RenderSamples=%d%s; sub-frames averaged per output frame. 1 = no blur\n"
 			"RenderShutter=%g%s; 1.0 = 360 degrees, 0.5 = the 180 film convention\n"
@@ -400,15 +421,20 @@ struct Config
 			"RenderHighlightBoost=%g%s; keeps specular streaks bright through accumulation\n"
 			"RenderJpeg=%d%s; 0 = PNG\n"
 			"RenderQuality=%d%s; JPEG only\n"
+			"; 0 auto (the add-on reads the back-buffer format) / 1 RGBA / 2 BGRA.\n"
+			"; Auto is known to get this wrong on Legacy, FiveM especially. Try 1, then 2.\n"
+			"RenderChannelOrder=%d%s; 0 auto / 1 RGBA / 2 BGRA\n"
 			"RenderHideHud=%d%s; hide the editor HUD and cursor while rendering\n"
 			"ExportCloseWhenDone=%d%s; return to the editor menus after an Export render\n"
 			"; Empty = RockstarEditorPlus\\Captures\\\n"
 			"RenderOutputFolder=%s\n\n",
 			enableRenderer ? 1 : 0,
+			renderCaptureMode == 1 ? "Sliding" : "Walking",
 			renderFps, "              ", renderSamples, "          ",
 			renderShutter, "          ", renderSettleFrames, "     ",
 			renderSettleSubFrames, "  ", renderHighlight, "   ",
 			renderJpeg ? 1 : 0, "               ", renderQuality, "            ",
+			renderChannelOrder, "      ",
 			renderHideHud ? 1 : 0, "            ",
 			exportCloseWhenDone ? 1 : 0, "      ",
 			renderOutputFolder.c_str());
@@ -444,7 +470,9 @@ struct Config
 			"; ============================================================================\n"
 			"; Record the project's sound and mux it into the video. One Export press does\n"
 			"; both passes: the project plays through once at normal speed to capture the\n"
-			"; sound, then rewinds to clip one and renders the frames. Needs RenderMode=Video.\n"
+			"; sound, then rewinds to clip one and renders the frames. Works in either\n"
+			"; RenderMode: Video muxes it in, Frames leaves it as audio.wav beside the\n"
+			"; sequence with the ffmpeg line to attach it written into assemble.txt.\n"
 			"RenderAudio=%d\n\n"
 			"; Or borrow the audio track from an existing file - normally a stock GTA\n"
 			"; export of the same project. Ignored while RenderAudio is on.\n"
@@ -471,14 +499,26 @@ struct Config
 
 		fclose(f);
 
+		// EVERY key the split moved. A key missing from here is carried into
+		// Render.ini and then LEFT BEHIND in the old one, so it exists twice and
+		// editing the copy that is no longer read does nothing - the exact
+		// failure the split was meant to end.
+		//
+		// RenderCaptureMode, RenderAudio and AudioFromFile were all missing. The
+		// first was found when it became a menu row (a row that writes a key
+		// which the migration does not clean up leaves the user two of them);
+		// the two audio keys are the same omission as the one the comment above
+		// records for the WRITING side, fixed there and not here.
 		static const char* const kMoved[] = {
 			"ExportAsImageSequence", "EnableRenderer", "RenderMode",
+			"RenderCaptureMode",
 			"RenderFps", "RenderSamples", "RenderShutter",
 			"RenderSettleFrames", "RenderSettleSubFrames", "RenderHighlightBoost",
 			"RenderJpeg", "RenderQuality", "RenderChannelOrder", "RenderHideHud",
 			"ExportCloseWhenDone", "RenderOutputFolder", "RenderVideo",
 			"RenderKeepFrames", "FfmpegPath", "RenderVideoPreset",
 			"RenderVideoArgs", "RenderVideoExt",
+			"RenderAudio", "AudioFromFile",
 		};
 		for (const char* k : kMoved)
 			WritePrivateProfileStringA("RockstarEditorPlus", k, nullptr, mainIni.c_str());
@@ -510,6 +550,39 @@ struct Config
 		char buf[64]{};
 		sprintf_s(buf, "%g", value);
 		WritePrivateProfileStringA("RockstarEditorPlus", key, buf, iniPath.c_str());
+	}
+
+	// The same three for the render settings, which live in their own file under
+	// their own section. A render row changed from the editor's export menu has
+	// to land where the loader reads it - writing it to the main ini would
+	// appear to work and then be overwritten by Render.ini on the next start,
+	// since the split reader takes the main ini only as the DEFAULT.
+	void writeRenderBool(const char* key, bool value) const
+	{
+		if (renderIniPath.empty()) return;
+		WritePrivateProfileStringA("Render", key, value ? "1" : "0", renderIniPath.c_str());
+	}
+
+	void writeRenderInt(const char* key, int value) const
+	{
+		if (renderIniPath.empty()) return;
+		char buf[32]{};
+		sprintf_s(buf, "%d", value);
+		WritePrivateProfileStringA("Render", key, buf, renderIniPath.c_str());
+	}
+
+	void writeRenderFloat(const char* key, float value) const
+	{
+		if (renderIniPath.empty()) return;
+		char buf[64]{};
+		sprintf_s(buf, "%g", value);
+		WritePrivateProfileStringA("Render", key, buf, renderIniPath.c_str());
+	}
+
+	void writeRenderStr(const char* key, const char* value) const
+	{
+		if (renderIniPath.empty()) return;
+		WritePrivateProfileStringA("Render", key, value, renderIniPath.c_str());
 	}
 
 	// --- image sequence render ------------------------------------------------
@@ -553,10 +626,20 @@ struct Config
 	// there is nothing extra to configure: the playback speed is derived from a
 	// measurement taken on the first frame.
 	//
-	// Sliding is SLOWER than walking - the world has to actually run - and its
-	// shutter is approximate, since the samples land on the instants the game
-	// presented rather than on exact midpoints. Pick it for simulation fidelity,
-	// not for picture quality.
+	// Sliding's shutter is APPROXIMATE - the samples land on the instants the
+	// game presented rather than on exact midpoints - so walking is still the
+	// one to pick when placement has to be exact, or when a sliding render comes
+	// out looking wrong.
+	//
+	// It is NOT the slower one, which this comment claimed for a long time on
+	// the reasoning that "the world has to actually run". Count the frames:
+	//     walking  = RenderSettleFrames + Samples * (1 + RenderSettleSubFrames)
+	//     sliding  = Samples / Shutter
+	// At the shipped defaults that is 3 + 64*2 = 131 against 64, so sliding is
+	// around 3x faster at a 360-degree shutter. The two are level at 180, and
+	// below that walking wins. presetmaker's help text had this right and this
+	// comment did not; the wrong version had already been copied into the export
+	// menu's description before anyone counted.
 	int   renderCaptureMode  = 1;
 
 	float renderFps          = 30.0f;
@@ -611,9 +694,13 @@ struct Config
 	// better default deliverable: a folder of eighteen thousand PNGs is only
 	// useful to someone who already intended to composite, and they can say so.
 	//
-	// It also has to agree with renderAudio below, which needs a video to mux
-	// into. Shipping audio on with Frames would be a default that silently
-	// cannot do what it says.
+	// This used to carry a second reason - that renderAudio "needs a video to mux
+	// into", so audio-on with Frames would be a default that could not do what it
+	// says. That was never true of this renderer: the audio pass writes a
+	// standalone audio.wav and runs in either mode, and writeAssembleHelp()
+	// already emits the ffmpeg line that attaches it. Frames+audio is a perfectly
+	// good deliverable. The claim had spread to the README, the generated
+	// Render.ini and the export menu before anyone checked it against the code.
 	RenderMode renderMode = RenderMode::Video;
 
 	bool wantsVideo() const { return renderMode == RenderMode::Video; }
@@ -641,10 +728,15 @@ struct Config
 	// that track is far less machinery than capturing sound ourselves.
 	std::string audioFromFile;
 
-	// Record the project's sound in real time, then render the frames, and mux
-	// the two. Both passes run off ONE Export press: the sound pass plays the
-	// project through at normal speed, and the renderer then steps the playhead
-	// back to clip one and starts the frames without leaving playback.
+	// Record the project's sound in real time, then render the frames. Both
+	// passes run off ONE Export press: the sound pass plays the project through
+	// at normal speed, and the renderer then steps the playhead back to clip one
+	// and starts the frames without leaving playback.
+	//
+	// INDEPENDENT OF renderMode. The pass writes a standalone audio.wav into the
+	// render folder either way; Video mode then muxes it into the encode, and
+	// Frames mode leaves it beside the sequence with the ffmpeg arguments to
+	// attach it written into assemble.txt.
 	//
 	// (It used to take two presses. A plain seek cannot return to the start of
 	// a project - it clamps to the clip on screen, and the sound pass ends on
@@ -653,8 +745,7 @@ struct Config
 	//
 	// On by default now that it costs one press rather than two. A silent
 	// render is almost never what someone wanted, and the failure was quiet -
-	// you found out when you opened the file. Needs renderMode Video, which is
-	// also the default; the two are set together deliberately.
+	// you found out when you opened the file.
 	bool renderAudio = true;
 
 	// Name of a preset in the mod's presets folder, e.g. "h265". When set and
@@ -688,10 +779,12 @@ struct Config
 	// EnableRenderer=1 in Render.ini when you want it.
 	bool  enableRenderer = false;
 
-	// Leave the editor's playback and return to its menus once an export render
-	// finishes, the same way a real export does. Only applies to renders started
-	// from the Export button - a render started from the camera menu leaves you
-	// where you were.
+	// Leave the editor's playback and return to its menus once a render
+	// finishes, the same way a real export does.
+	//
+	// This used to say "only applies to renders started from the Export button -
+	// a render started from the camera menu leaves you where you were". There is
+	// no camera-menu render any more, so it applies to every render there is.
 	bool  exportCloseWhenDone = true;
 
 	// Where sequences are written. Empty = a single RockstarEditorPlus_Captures
@@ -873,6 +966,15 @@ struct Config
 		if (renderSettleSubFrames < 1) renderSettleSubFrames = 1;
 		renderJpeg         = rBool("RenderJpeg", renderJpeg);
 		renderQuality      = rInt("RenderQuality", renderQuality);
+
+		// THIS LINE WAS MISSING. The key was declared, copied into the render
+		// settings, handed to the add-on and listed in kMoved so the migration
+		// deleted it from the old ini - everything except being read. So it sat
+		// at its default of 0 (Auto) whatever anyone wrote in the file, and the
+		// reports were exactly what you would expect: "inverted colours, and it
+		// makes no difference whether I set Auto, RGBA or BGRA", because only
+		// Auto ever ran.
+		renderChannelOrder = rInt("RenderChannelOrder", renderChannelOrder);
 		renderHighlight    = rFloat("RenderHighlightBoost", renderHighlight);
 		renderHideHud         = rBool("RenderHideHud", renderHideHud);
 		// Both of these were renamed. Read the OLD key first so an existing

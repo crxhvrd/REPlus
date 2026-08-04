@@ -8,7 +8,6 @@
 #include "main.h"
 #include "capture/render.h"
 #include "capture/fxcapture.h"
-#include "replay/marker.h"
 #include "capture/exporthook.h"
 #include "capture/videoout.h"
 #include "capture/audioout.h"
@@ -114,6 +113,20 @@ namespace render
 		// Bias it down and let the controller climb: the climb costs a few soft
 		// frames, the alternative costs a smeared one.
 		constexpr float kSlideCalibBias = 0.35f;
+
+		// --- position steering -------------------------------------------------
+		// How much of the measured drift is taken out per cycle. The controller
+		// gets exactly one correction per output frame, and the measurement is
+		// quantised by the present that carried it, so a full-gain response
+		// chases quantisation noise and rings. Half settles in about two frames.
+		constexpr double kSlideDriftGain = 0.5;
+
+		// Bounds on the corrected target span, as a fraction of the wanted one.
+		// Deliberately lopsided - see the note at the controller. Behind is free,
+		// ahead is not, so slowing down is allowed almost without limit and
+		// catching up is rationed.
+		constexpr double kSlideTargetLo = 0.05;
+		constexpr double kSlideTargetHi = 1.75;
 
 		// Project time is OURS; the game seeks in the current clip's own time.
 		// s_clipBase is where the live clip starts in its timeline, s_clipProjAt
@@ -777,28 +790,6 @@ namespace render
 			s_step = Step::ClipJump;
 		}
 
-		// Clip bounds from the markers. The editor has no exposed clip-length
-		// accessor we have resolved, and the marker span is the region the
-		// camera work actually covers, so it is the honest range to render.
-		bool markerRange(float& lo, float& hi)
-		{
-			void* storage = game::markerStorage();
-			if (!storage) return false;
-
-			const int n = rstorage::markerCount(storage);
-			if (n < 2) return false;
-
-			bool any = false;
-			for (int i = 0; i < n; ++i)
-			{
-				void* m = rstorage::tryGetMarker(storage, i);
-				if (!m) continue;
-				const float t = rmarker::timeMs(m);
-				if (!any) { lo = hi = t; any = true; }
-				else { if (t < lo) lo = t; if (t > hi) hi = t; }
-			}
-			return any && hi > lo;
-		}
 	}
 
 	Settings& settings() { return s_cfg; }
@@ -914,14 +905,15 @@ namespace render
 
 	namespace
 	{
-		// Everything both entry points need once a range is known.
+		// Everything the render needs once a range is known.
 		//
-		// walkClips is what separates the two: an export renders the PROJECT and
-		// must step through its clips, while a render started from the camera
-		// menu covers a marker range inside the clip being edited and has no
-		// business leaving it.
-		bool begin(float startMs, int frames, bool openEnded, bool walkClips,
-		           const char** reason)
+		// This used to take a `walkClips` flag, because there were two entry
+		// points: an export renders the PROJECT and must step through its clips,
+		// while a render started from the camera menu covered a marker range
+		// inside the clip being edited and had no business leaving it. That
+		// second entry point is gone with the menu row that reached it, so the
+		// flag could only ever be true and the clip walk is unconditional.
+		bool begin(float startMs, int frames, bool openEnded, const char** reason)
 		{
 			static const char* kNoFolder = "could not create the output folder";
 
@@ -962,7 +954,6 @@ namespace render
 			s_clipN    = 0;
 			s_wantClip = -1;
 			s_clipWait = 0;
-			if (walkClips)
 			{
 				const int at = game::clipIndex();
 				if (at >= 0)
@@ -1121,7 +1112,30 @@ namespace render
 			source    = "from the audio pass";
 		}
 
-		if (!begin(now, frames, openEnded, true, reason)) return false;
+		// An unreadable clip table is a QUIET failure, and it is the one that
+		// produces "the render doesn't work" reports.
+		//
+		// clipCount() answers through the playback controller, whose montage
+		// pointer is only populated once the project has actually been loaded
+		// for playback. Read it too early and the project honestly reports zero
+		// clips - at which point everything downstream degrades instead of
+		// stopping: the frame count becomes unbounded, s_clipN is 0, so
+		// JumpToClip is never issued and the render ends at the first clip
+		// boundary. On a single-clip project that is invisible; on a multi-clip
+		// one you get clip one and nothing else, with no line anywhere saying so.
+		//
+		// It stays a fallback rather than becoming an abort - a render that
+		// covers one clip beats one that refused - but it says what happened,
+		// which is the whole difference between this and a bug report.
+		if (clips <= 0 || totalMs <= 1.0f)
+			logger::write("info",
+				"render: !! the project's clip table read %d clip(s)/%.0fms - rendering "
+				"OPEN-ENDED from the playhead. Multi-clip stepping is OFF, so this will "
+				"stop at the end of the current clip. This usually means the project was "
+				"not fully loaded for playback; open it in the editor first, then Export.",
+				clips, totalMs);
+
+		if (!begin(now, frames, openEnded, reason)) return false;
 		s_fromExport = true;
 
 		if (openEnded)
@@ -1134,35 +1148,6 @@ namespace render
 				"%d frames (%.2fs, %s), replayMode=%d -> %s",
 				now * 0.001f, s_cfg.fps, s_cfg.samples, s_clipN, frames,
 				totalMs * 0.001f, source, s_startMode, s_folder);
-		return true;
-	}
-
-	bool start(const char** reason)
-	{
-		static const char* kNoAddon  = "capture addon not loaded";
-		static const char* kNotEdit  = "not in the Rockstar Editor";
-		static const char* kNoRange  = "need at least two markers";
-		static const char* kBusy     = "already rendering";
-
-		if (s_step != Step::Idle) { if (reason) *reason = kBusy; return false; }
-
-		fxcapture::init();
-		if (!fxcapture::addonPresent()) { if (reason) *reason = kNoAddon; return false; }
-		if (!game::isEditModeActive())  { if (reason) *reason = kNotEdit; return false; }
-
-		float lo = 0.0f, hi = 0.0f;
-		if (!markerRange(lo, hi)) { if (reason) *reason = kNoRange; return false; }
-
-		if (s_cfg.fps < 1.0f) s_cfg.fps = 1.0f;
-		const int frames = (int)((hi - lo) / (1000.0f / s_cfg.fps)) + 1;
-
-		// walkClips false: a marker range belongs to the clip being edited, so
-		// running off its end is the end of this render, not a reason to pull
-		// the next clip of the project in behind it.
-		if (!begin(lo, frames, false, false, reason)) return false;
-
-		logger::write("info", "render: started - %d frames, %.2f..%.2fs @ %.3g fps, %d sample(s) -> %s",
-			s_frames, lo * 0.001f, hi * 0.001f, s_cfg.fps, s_cfg.samples, s_folder);
 		return true;
 	}
 
@@ -1208,6 +1193,16 @@ namespace render
 			if (!s_saidInEd && game::isEditModeActive() && Config::get().enableRenderer)
 			{
 				s_saidInEd = true;
+
+				// Re-check WHICH ReShade, for the same reason this whole block
+				// exists. The startup scan runs before ReShade is necessarily in
+				// the module list, so it can report "no ReShade in this process"
+				// at a machine that plainly has one - and that line then stands
+				// unchallenged for the rest of the session. hostState() logs only
+				// when the answer changes, so a correct startup guess costs
+				// nothing here and a wrong one gets superseded.
+				fxcapture::hostState();
+
 				if (fxcapture::addonPresent())
 					logger::write("info",
 						"capture: editor open, addon PRESENT (heartbeat=%u) - Export will "
@@ -1216,9 +1211,11 @@ namespace render
 					logger::write("info",
 						"capture: editor open but the addon is NOT presenting (channel=%s, "
 						"heartbeat=0). Export WILL fall back to the game's own encoder. "
-						"IgcsConnector.addon64 is either not loaded or never reaching its "
-						"present callback - check ReShade has add-on support, that the "
-						"add-on is enabled, and that nothing else (ENB) owns present.",
+						"Rendering needs ReShade WITH FULL ADD-ON SUPPORT plus the "
+						"IgcsConnector.addon64 BUNDLED WITH THIS MOD - any other one lacks "
+						"the capture channel and will present without ever grabbing a "
+						"frame. If both are right, check the add-on is enabled and that "
+						"nothing else (ENB) owns present.",
 						fxcapture::available() ? "mapped" : "NOT MAPPED");
 			}
 
@@ -1797,40 +1794,73 @@ namespace render
 				s_slideCapture = false;
 				s_slideSample  = 0;
 
-				// Steer the speed so the N samples span the SHUTTER.
+				// Steer on POSITION, not on rate.
 				//
-				// With the count now fixed, the free variable is how much clip time
-				// they cover. Too fast and N samples smear across more than the
-				// frame interval, which also overshoots the next mark and starves
-				// the advance phase; too slow and the blur trail is shorter than
-				// asked for and the render takes longer than it needs to.
+				// The obvious controller here asks "did N samples span the shutter"
+				// and nudges the speed until they do. That regulates the exposure
+				// LENGTH and says nothing about where on the output timeline the
+				// exposure sat, and the difference is what decides whether the
+				// finished video plays at a constant speed.
 				//
-				// Deliberately NOT proportional. A measured span of one frame is a
-				// noisy sample of a rate that moves on its own, so this nudges by a
-				// fixed factor only when the answer is clearly outside the band -
-				// the same shape as the controller in the free-roam renderer, which
-				// settles instead of oscillating.
+				// A player assumes frame f covers exactly f*dt onwards. Nothing in a
+				// rate controller anchors it there, and it is blind by construction: a
+				// clock running at exactly the right RATE but a few milliseconds behind
+				// measures its own span as perfect and corrects nothing, so the offset
+				// stays forever. Cruise control holds the speed and has no opinion
+				// about being three miles from where you meant to be.
+				//
+				// The advance phase below looks like it already covers that - it waits
+				// for the absolute grid, `s_slideTime >= s_frame * s_dt`, so an error
+				// cannot compound. True for a short shutter, and FALSE at the default
+				// 360 degrees, which is the case that matters: there the wanted span IS
+				// the frame interval, so no advance slack is left to absorb anything.
+				// The test only enforces "not earlier than" - it can wait, it cannot
+				// rewind - so an exposure that ran long pushes the next mark late by the
+				// overshoot and every later frame inherits it. Hitches only ever add.
+				// A one-way ratchet, and exactly the "the video drifts in time" symptom.
+				//
+				// So compare against where the exposure SHOULD have closed and fold the
+				// difference into the next cycle. Absolute, so it does not matter how
+				// the error arose, and self-correcting rather than merely
+				// non-compounding.
 				if (s_cfg.samples > 1)
 				{
 					const double want     = (double)s_dt * (double)s_cfg.shutter;
 					const double consumed = s_slideTime - s_slideMark;
 
-					// Two regimes. A small error is trimmed gently, because one
-					// frame is a noisy sample of a rate that moves on its own and
-					// chasing it exactly oscillates. A LARGE error is not noise -
-					// it is a wrong operating point, and nudging it by 25% a frame
-					// took fourteen frames to walk back from one bad start. Solve
-					// those directly, bounded so a single freak frame cannot throw
-					// the speed across its whole range.
-					if (consumed > want * 1.5 || consumed < want * 0.5)
+					// s_frame is still the frame just exposed - it is incremented below -
+					// so this is that frame's own slot on the grid.
+					const double idealEnd = (double)s_frame * (double)s_dt + want;
+					const double drift    = s_slideTime - idealEnd;   // + = running ahead
+
+					// Half the drift, not all of it. One frame's clock reading is
+					// quantised by the present that carried it, so this is a noisy
+					// measurement; correcting it in full chases the noise and rings.
+					double target = want - drift * kSlideDriftGain;
+
+					// Asymmetric on purpose. The two directions are not equivalent:
+					// running BEHIND is absorbed by the advance wait and costs nothing,
+					// while running AHEAD cannot be undone without a seek - and a seek is
+					// the zero-delta frame this whole mode exists to avoid. So the loop
+					// may slow almost to a stop to let the grid catch up, and may only
+					// hurry back gently. It settles fractionally short, the harmless side.
+					const double lo = want * kSlideTargetLo;
+					const double hi = want * kSlideTargetHi;
+					if (target < lo) target = lo;
+					if (target > hi) target = hi;
+
+					// Proportional, and it replaces the old two-regime nudge outright.
+					// That version corrected nothing at all inside a +/-15% band, which is
+					// precisely where a standing offset lives, and needed a separate fast
+					// path for large errors because a fixed 10% step took fourteen frames
+					// to walk back from a bad start. One clamped ratio does both jobs.
+					if (consumed > 0.0)
 					{
-						double k = want / (consumed > 0.0 ? consumed : want);
+						double k = target / consumed;
 						if (k < 0.1) k = 0.1;
 						if (k > 4.0) k = 4.0;
 						s_slideSpeed = (float)((double)s_slideSpeed * k);
 					}
-					else if (consumed > want * 1.15) s_slideSpeed *= 0.90f;
-					else if (consumed < want * 0.85) s_slideSpeed *= 1.10f;
 
 					if (s_slideSpeed < 0.001f) s_slideSpeed = 0.001f;
 					if (s_slideSpeed > 1.0f)   s_slideSpeed = 1.0f;
@@ -1842,8 +1872,8 @@ namespace render
 						s_slideLogged = shown;
 						logger::write("info",
 							"render: sliding - %d sample(s) spanned %.1fms of a %.1fms "
-							"shutter; speed now %.4gx",
-							s_cfg.samples, consumed, want, s_slideSpeed);
+							"shutter, drift %+.1fms; speed now %.4gx",
+							s_cfg.samples, consumed, want, drift, s_slideSpeed);
 					}
 				}
 

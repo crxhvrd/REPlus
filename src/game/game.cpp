@@ -76,6 +76,21 @@ namespace game
 	uintptr_t addr_g_EditClipController = 0;
 	uintptr_t addr_g_EditClipIndex      = 0;
 
+	// The export menu. Both builds; independent of everything above, so it can
+	// resolve when the marker menu does not and vice versa.
+	uintptr_t addr_VEMenuOpen           = 0;
+	uintptr_t addr_VEAdjustToggle       = 0;
+	uintptr_t addr_VEGetToggleString    = 0;
+	uintptr_t addr_VEIsItemSelectable   = 0;
+	uintptr_t addr_VEBuildMenu          = 0;
+	uintptr_t addr_TextGet              = 0;
+	uintptr_t addr_g_VEMenuArray        = 0;
+	uintptr_t addr_g_VECurrentColumn    = 0;
+	uintptr_t addr_g_VEMenuIdForColumn  = 0;
+	uintptr_t addr_g_VECurrentItem      = 0;
+	uintptr_t addr_MemAlloc             = 0;
+	uintptr_t addr_MemFree              = 0;
+
 	// -------------------------------------------------------------------------
 	// The project's clips, off CReplayCoordinator's CReplayPlaybackController.
 	//
@@ -310,6 +325,36 @@ namespace game
 		return a;
 	}
 
+	// Same idea for the operand MSVC encodes as an ABSOLUTE RVA rather than
+	// RIP-relative - `mov r8d,[r14+rdx*4+0x1F63EC0]`, where r14 already holds
+	// the image base. Only Legacy needs this; Clang uses ordinary LEAs.
+	//
+	// The range check is the same one and matters more here, not less: a wrong
+	// disp32 read out of an unrelated instruction is just as plausible-looking,
+	// and there is no rel32 arithmetic to make it obviously silly.
+	static uintptr_t deriveAbs(uintptr_t base, const gsig::DeriveAbs& d, const char* what)
+	{
+		if (!base) return 0;
+		const unsigned char* insn = (const unsigned char*)(base + d.insn);
+		if (memcmp(insn, d.op, (size_t)d.opLen) != 0)
+		{
+			logger::write("info", "  !! %s: opcode mismatch at +0x%X - build drifted", what, d.insn);
+			return 0;
+		}
+
+		const uintptr_t a = memory::base() + (uintptr_t)*(const uint32_t*)(base + d.disp);
+		if (a < memory::base() || a >= memory::base() + memory::imageSize())
+		{
+			logger::write("info",
+				"  !! %s: derived %p is outside the module - refusing it", what, (void*)a);
+			return 0;
+		}
+
+		logger::write("info", "  %-22s = %p (rva 0x%llX)", what, (void*)a,
+			(uint64_t)(a - memory::base()));
+		return a;
+	}
+
 	uintptr_t addr_g_Project = 0;
 
 	// The open project's name, validated rather than trusted.
@@ -507,6 +552,69 @@ namespace game
 		addr_g_MenuOptions        = derive(b, gsig::PCM_MENUOPTIONS, "g_MenuOptions");
 		addr_ArrayGrow            = derive(b, gsig::PCM_GROW,        "ArrayGrow");
 		addr_g_MenuFocusIndex     = derive(addr_MenuInput, gsig::MI_FOCUSINDEX, "g_MenuFocusIndex");
+	}
+
+	bool exportMenuReady()
+	{
+		return addr_VEMenuOpen && addr_VEAdjustToggle && addr_VEGetToggleString &&
+		       addr_TextGet && addr_VEIsItemSelectable && addr_VEBuildMenu &&
+		       addr_g_VEMenuArray && addr_g_VECurrentColumn &&
+		       addr_g_VEMenuIdForColumn && addr_g_VECurrentItem &&
+		       addr_MemAlloc && addr_MemFree;
+	}
+
+	// The export screen's own rows. Independent of resolveMenu() above - the two
+	// menus share nothing but the movie - so one can fail without taking the
+	// other with it. Failure here leaves Export exactly as R* shipped it.
+	static void resolveExportMenu()
+	{
+		auto scan1 = [](const gsig::Sig& s, const char* what) -> uintptr_t {
+			const char* p = pick(s);
+			if (!p || !*p) return 0;
+			const uintptr_t a = memory::scan(p, true).address;
+			logger::write("info", "  %-22s = %p (rva 0x%llX)", what, (void*)a,
+				(uint64_t)(a ? a - memory::base() : 0));
+			return a;
+		};
+
+		addr_VEMenuOpen        = scan1(gsig::VEMENU_OPEN,            "VEMenu::Open");
+		addr_VEAdjustToggle    = scan1(gsig::VEMENU_ADJUSTTOGGLE,    "VEMenu::AdjustToggle");
+		addr_VEGetToggleString = scan1(gsig::VEMENU_GETTOGGLESTRING, "VEMenu::GetToggleStr");
+		addr_VEBuildMenu       = scan1(gsig::VEMENU_BUILDMENU,       "VEMenu::BuildMenu");
+		addr_TextGet           = scan1(gsig::VEMENU_TEXTGET,         "CText::Get");
+		addr_MemAlloc          = scan1(gsig::VEMENU_MEMALLOC,        "MemAlloc");
+		addr_MemFree           = scan1(gsig::VEMENU_MEMFREE,         "MemFree");
+
+		if (const uintptr_t b = addr_VEAdjustToggle)
+		{
+			addr_g_VECurrentColumn  = derive(b, pickD(gsig::ATV_CURRENTCOLUMN),    "ms_iCurrentColumn");
+			addr_VEIsItemSelectable = derive(b, pickD(gsig::ATV_ISITEMSELECTABLE), "IsItemSelectable");
+
+			// The one place the two builds need different derive KINDS rather
+			// than different offsets: MSVC indexes both arrays off a register
+			// holding the image base, so the array address is an absolute RVA
+			// sitting in the instruction's disp32.
+			if (isEnhanced())
+			{
+				addr_g_VEMenuIdForColumn = derive(b, gsig::ATV_E_MENUIDFORCOL, "ms_iMenuIdForColumn");
+				addr_g_VECurrentItem     = derive(b, gsig::ATV_E_CURRENTITEM,  "ms_iCurrentItem");
+			}
+			else
+			{
+				addr_g_VEMenuIdForColumn = deriveAbs(b, gsig::ATV_L_MENUIDFORCOL, "ms_iMenuIdForColumn");
+				addr_g_VECurrentItem     = deriveAbs(b, gsig::ATV_L_CURRENTITEM,  "ms_iCurrentItem");
+			}
+		}
+
+		// ms_MenuArray comes out of IsItemSelectable's own bounds check, which
+		// reads the u16 element count at +8 - the shallowest reference to the
+		// array in either binary.
+		if (addr_VEIsItemSelectable)
+		{
+			const uintptr_t count = derive(addr_VEIsItemSelectable,
+				pickD(gsig::IIS_MENUARRAY_COUNT), "ms_MenuArray.count");
+			if (count) addr_g_VEMenuArray = count - gsig::VEMENU_ARRAY_COUNT_OFF;
+		}
 	}
 
 	bool resolve()
@@ -869,6 +977,10 @@ namespace game
 
 		resolveMenu();
 		logger::write("info", "  menu injection: %s", menuReady() ? "available" : "UNAVAILABLE");
+
+		resolveExportMenu();
+		logger::write("info", "  export menu rows: %s",
+			exportMenuReady() ? "available" : "UNAVAILABLE");
 
 		// GetPreviousMarkerIndex is deliberately NOT required: Clang inlines it
 		// on Enhanced, so there is nothing to resolve there and prevMarkerIndex()

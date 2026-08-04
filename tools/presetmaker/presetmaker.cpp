@@ -74,7 +74,7 @@ static Setting kSettings[] =
 
 { "RenderMode", "Output", S_CHOICE, "Video|Frames",
   "Video   - frames are handed to ffmpeg as they finish and deleted, so a long render costs a couple of files at a time. Audio is muxed in.\r\n"
-  "Frames  - numbered PNG/JPEG sequence with an assemble.txt of ready-made ffmpeg commands. No audio.\r\n"
+  "Frames  - numbered PNG/JPEG sequence with an assemble.txt of ready-made ffmpeg commands. Audio lands as audio.wav beside them, and assemble.txt carries the line that attaches it.\r\n"
   "The capture itself is identical either way.", false, true },
 
 { "RenderCaptureMode", "Capture mode", S_CHOICE, "Walking|Sliding",
@@ -109,8 +109,8 @@ static Setting kSettings[] =
 
 // --- right column ---
 { "RenderAudio", "Record audio", S_BOOL, nullptr,
-  "One Export press does two passes: the project plays through once at normal speed to capture sound, then rewinds and renders the frames. "
-  "Muxed at the end. Requires Output = Video.", false },
+  "One Export press does two passes: the project plays through once at normal speed to capture sound, then rewinds and renders the frames.\r\n"
+  "Works in either Output mode: Video muxes it in, Frames leaves it as audio.wav beside the sequence with the ffmpeg line to attach it in assemble.txt.", false },
 
 { "RenderHideHud", "Hide HUD while rendering", S_BOOL, nullptr,
   "Hides the editor HUD and cursor for the duration and restores them afterwards.", false },
@@ -123,6 +123,11 @@ static Setting kSettings[] =
 
 { "RenderJpeg", "Write JPEG instead of PNG", S_BOOL, nullptr,
   "PNG is lossless and the default. JPEG is smaller and faster to write, and lossy.", false },
+
+{ "RenderChannelOrder", "Colour channels", S_CHOICE, "Auto|RGBA|BGRA",
+  "Which order the add-on reads the back buffer's colour channels in.\r\n"
+  "Auto works it out from the buffer's own format and is right nearly always. Force RGBA or BGRA if a render comes out with red and blue swapped - skies orange, cars the wrong colour - which some Legacy setups produce.\r\n"
+  "Affects only what is written to disk; nothing on screen changes.", false, false },
 
 { "RenderQuality", "JPEG quality", S_INT, nullptr,
   "1 to 100. Only used when JPEG is on.", false },

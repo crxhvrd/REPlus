@@ -124,16 +124,21 @@ namespace fxcapture
 			return false;
 		}
 
-		void reportReShade()
+		// Walks the loaded modules for the add-on host. `outPath` is optional and
+		// receives the module's file name when one is found.
+		//
+		// Factored out of reportReShade so the menu can ask the same question the
+		// log answers, rather than the two drifting into different opinions about
+		// what is installed.
+		HostState scanHost(char* outPath, size_t cap)
 		{
+			if (outPath && cap) outPath[0] = '\0';
+
 			HMODULE mods[1024]{};
 			DWORD   need = 0;
 			if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need))
-			{
-				logger::write("info", "capture: could not enumerate modules - "
-					"cannot tell which ReShade is loaded");
-				return;
-			}
+				return HOST_NONE;
+
 			const DWORD count = (need > sizeof(mods) ? sizeof(mods) : need) / sizeof(HMODULE);
 
 			HMODULE addonCapable = nullptr, looksLikeReShade = nullptr;
@@ -149,26 +154,41 @@ namespace fxcapture
 					looksLikeReShade = mods[i];
 			}
 
-			char path[MAX_PATH]{};
-			if (addonCapable)
+			HMODULE found = addonCapable ? addonCapable : looksLikeReShade;
+			if (outPath && cap && found) GetModuleFileNameA(found, outPath, (DWORD)cap);
+
+			return addonCapable ? HOST_ADDONS
+			     : looksLikeReShade ? HOST_NO_ADDONS
+			                        : HOST_NONE;
+		}
+
+		void reportHost(HostState s, const char* path)
+		{
+			switch (s)
 			{
-				GetModuleFileNameA(addonCapable, path, MAX_PATH);
+			case HOST_ADDONS:
 				logger::write("info", "capture: ReShade WITH add-on support -> %s", path);
-			}
-			else if (looksLikeReShade)
-			{
-				GetModuleFileNameA(looksLikeReShade, path, MAX_PATH);
+				break;
+
+			case HOST_NO_ADDONS:
 				logger::write("info",
 					"capture: !! ReShade is loaded (%s) but it is the ORDINARY build - it "
 					"cannot load add-ons at all, so IgcsConnector will never run and Export "
 					"will always fall back to the game's own encoder. Reinstall ReShade and "
 					"choose the version WITH full add-on support.", path);
-			}
-			else
-			{
+				break;
+
+			default:
+				// "not yet" rather than "not at all" - see hostState(). This line
+				// at startup means nothing on its own; what matters is whether a
+				// later one supersedes it.
 				logger::write("info",
-					"capture: no ReShade in this process. Rendering and depth of field need "
-					"ReShade WITH full add-on support; everything else works without it.");
+					"capture: no ReShade in this process YET. This is checked again while "
+					"the editor is open, and a later line supersedes this one - so if none "
+					"follows, ReShade really is absent or is not a build we can see. "
+					"Rendering and depth of field need ReShade WITH full add-on support; "
+					"everything else works without it.");
+				break;
 			}
 		}
 
@@ -209,9 +229,11 @@ namespace fxcapture
 			existed ? "joined" : "created",
 			s_block->addonHeartbeat ? "present" : "not seen yet");
 
-		// Which ReShade, if any. The answer decides whether rendering can work
-		// at all, and it is knowable here rather than after a failed Export.
-		reportReShade();
+		// Which ReShade, if any. The answer decides whether rendering can work at
+		// all - but it is NOT reliably knowable this early, so this only seeds
+		// the first report and hostState() corrects it later if the module list
+		// grows. See the note there.
+		hostState();
 	}
 
 	bool available()    { return s_block != nullptr; }
@@ -233,6 +255,44 @@ namespace fxcapture
 	}
 
 	bool addonPresent() { return s_block && vread(s_block->addonHeartbeat) != 0; }
+
+	// -------------------------------------------------------------------------
+	// Which ReShade is loaded - re-checked until it settles, and logged whenever
+	// the answer CHANGES.
+	//
+	// The startup report used to be the only one, and it was frequently wrong:
+	// "no ReShade in this process" written by an ASI that had installed before
+	// ReShade's DLL was in the module list. The user then has a log confidently
+	// contradicting a ReShade they can see running, and nothing ever corrects it.
+	//
+	// A single answer is the wrong shape for this question. Module lists grow,
+	// and the honest report is a TRANSITION: say what is true now, say it again
+	// if it stops being true. So this logs on change, and the startup line says
+	// "YET" and that a later line supersedes it.
+	//
+	// Only HOST_ADDONS settles - that cannot become untrue, ReShade does not
+	// unload. Everything else keeps re-scanning, which is what lets the
+	// correction happen at all.
+	// -------------------------------------------------------------------------
+	HostState hostState()
+	{
+		static HostState s_cached   = HOST_NONE;
+		static int       s_reported = -1;     // nothing said yet
+		static bool      s_settled  = false;
+
+		if (s_settled) return s_cached;
+
+		char path[MAX_PATH]{};
+		s_cached = scanHost(path, sizeof(path));
+		if (s_cached == HOST_ADDONS) s_settled = true;
+
+		if ((int)s_cached != s_reported)
+		{
+			s_reported = (int)s_cached;
+			reportHost(s_cached, path);
+		}
+		return s_cached;
+	}
 	bool lastDone()     { return !s_block || vread(s_block->ackId) == vread(s_block->requestId); }
 
 	uint32_t heartbeat() { return s_block ? vread(s_block->addonHeartbeat) : 0; }

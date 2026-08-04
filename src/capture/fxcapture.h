@@ -59,6 +59,25 @@ namespace fxcapture
 
 	bool available();      // channel mapped
 	bool addonPresent();   // addon is alive - it bumps a heartbeat every present
+
+	// Which ReShade, if any, is in this process.
+	//
+	// The renderer reads the back buffer through a ReShade ADD-ON, so the
+	// ordinary ReShade build cannot drive it at all - and that is the single
+	// most common reason Export falls back to the game's own encoder. Decided by
+	// the same test ReShade's own add-on header uses to find its host: a loaded
+	// module exporting ReShadeRegisterAddon.
+	//
+	// Reported at startup, and read by the export menu so the requirement can be
+	// stated on screen with the CURRENT answer next to it rather than as a line
+	// in a readme nobody has open.
+	enum HostState
+	{
+		HOST_NONE = 0,   // no ReShade in the process at all
+		HOST_NO_ADDONS,  // ReShade, but the build that cannot load add-ons
+		HOST_ADDONS,     // ReShade with full add-on support
+	};
+	HostState hostState();
 	bool lastDone();       // addon has acknowledged the most recent request
 
 	// The addon's per-present counter. The render loop uses this as its frame

@@ -223,6 +223,9 @@ RenderSettleSubFrames=1    ; Walking: wait between sub-samples. Never 0
 RenderHighlightBoost=0.9   ; keeps speculars bright through accumulation
 RenderJpeg=0               ; 0 = PNG
 RenderQuality=90           ; JPEG only
+; Auto is known to get this wrong on Legacy, FiveM especially - renders come out
+; with the colours wrong while the screen looks fine. Try 1, then 2.
+RenderChannelOrder=0       ; 0 auto / 1 RGBA / 2 BGRA
 RenderHideHud=1            ; hide the editor HUD and cursor while rendering
 ExportCloseWhenDone=1      ; return to the editor menus when done
 ; Empty = RockstarEditorPlus\Captures\
@@ -241,7 +244,10 @@ RenderVideoArgs=-c:v libx264 -crf 16 -preset slow -pix_fmt yuv420p
 RenderVideoExt=mp4
 
 ; --- Audio ------------------------------------------------------------------
-RenderAudio=1              ; one Export: a sound pass, then the frames. Video only
+; One Export press: a sound pass, then the frames. Works in either RenderMode -
+; Video muxes it in, Frames leaves audio.wav beside the sequence with the ffmpeg
+; line to attach it written into assemble.txt.
+RenderAudio=1
 ; Borrow a track from a file instead. Ignored while RenderAudio=1.
 AudioFromFile=
 ]==])
@@ -296,7 +302,12 @@ target_link_libraries(RockstarEditorPlus version.lib shell32.lib debug minhook.x
 # =============================================================================
 add_executable(PresetMaker WIN32 tools/presetmaker/presetmaker.cpp)
 set_target_properties(PresetMaker PROPERTIES
-    OUTPUT_NAME "RE+ Preset Maker"
+    # The name it ships under, which is also what the tool calls itself in its
+    # own title bars and message boxes. It stopped being a preset maker when it
+    # grew a table of every Render.ini key; only this line still said otherwise,
+    # so a build produced "RE+ Preset Maker.exe" next to the shipped
+    # "RE+ Render Settings.exe" and left two of them in the folder.
+    OUTPUT_NAME "RE+ Render Settings"
     RUNTIME_OUTPUT_DIRECTORY         "${CMAKE_BINARY_DIR}/BIN/"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_BINARY_DIR}/BIN/Debug/"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/BIN/Release/"

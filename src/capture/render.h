@@ -54,13 +54,18 @@ namespace render
 	// Copy the persisted values out of the ini. Call once at startup.
 	void applyConfig();
 
-	// Begin a render across the marker range. Returns false with a reason when
-	// it cannot start (no addon, not in the editor, fewer than two markers).
-	bool start(const char** reason);
-
 	// Begin at the current playhead and run until the replay clock stops
-	// following our seeks - used by the Export path, where the range is the
-	// whole project and no duration accessor has been resolved.
+	// following our seeks. THE only entry point: the Export button, diverted in
+	// exporthook.cpp, is what reaches it.
+	//
+	// There used to be a second one, start(), which rendered the marker range of
+	// the clip being edited and was reached from a row in the camera menu. Both
+	// are gone - the row first (render settings became ini-only), the function
+	// when it was noticed that nothing had called it since. Worth knowing because
+	// the two had materially different preconditions: that one refused unless a
+	// clip was open in edit mode with at least two markers on it, and this one
+	// has no such requirement. Diagnosing a report against the wrong set of
+	// preconditions is exactly what its continued presence caused.
 	bool startOpenEnded(const char** reason);
 
 	void cancel();
