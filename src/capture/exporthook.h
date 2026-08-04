@@ -27,5 +27,10 @@ namespace exporthook
 	// something patched over us after we installed. Compares the bytes we left
 	// there against what is there now.
 	bool hookIntact();
+
+	// Was the detour ever written at all? A failed INSTALL and a detour someone
+	// else overwrote look identical from hookIntact() alone, and they need
+	// completely different advice.
+	bool hookInstalled();
 	void clearPending();
 }

@@ -137,6 +137,13 @@ namespace exporthook
 	void     clearPending() { s_pending = false; }
 	unsigned openCount() { return s_opens; }
 
+	// Did our detour ever get written? Distinct from hookIntact(), and the
+	// distinction matters: with the two conflated, a hook that FAILED TO INSTALL
+	// reported itself as "another mod has patched over it" - accusing a third
+	// party of something we had not managed to do in the first place. That is a
+	// bad line to hand someone diagnosing a conflict.
+	bool hookInstalled() { return s_prologueSaved; }
+
 	bool hookIntact()
 	{
 		if (!s_prologueSaved || !game::addr_PlaybackOpen) return false;

@@ -209,13 +209,50 @@ public:
 			return false;
 		}
 
-		const auto en = MH_EnableHook(MH_ALL_HOOKS);
+		// Enable THIS hook, and RETRY the transient failure.
+		//
+		// Two things were wrong here, and the second one only shows up on a busy
+		// process.
+		//
+		// It used to enable MH_ALL_HOOKS after every single create, so installing
+		// ~26 hooks re-walked every hook already created, 26 times, for no gain.
+		//
+		// And MinHook freezes threads before patching, which means
+		// CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) - a call that fails with
+		// ERROR_BAD_LENGTH when the process's thread list changes while it is
+		// being walked, and which Microsoft document as retryable. MinHook
+		// reports that as MH_ERROR_MEMORY_ALLOC, which is a badly misleading
+		// name: nothing has run out of memory, the snapshot just lost a race.
+		//
+		// It never bit while init happened ~90s in, on a quiet process. Moving
+		// the FiveM path to attach+5s put it in the middle of CEF, V8 and mono
+		// starting their thread pools, and most of the install started failing -
+		// including the Export hook, which then reported itself as "patched over
+		// by another mod". Retrying costs nothing when the snapshot succeeds.
+		MH_STATUS en = MH_OK;
+		int tries = 0;
+		for (; tries < 20; ++tries)
+		{
+			en = MH_EnableHook((void*)address);
+			if (en != MH_ERROR_MEMORY_ALLOC) break;   // i.e. not the snapshot race
+			Sleep(15);
+		}
+
 		if (en != MH_OK)
 		{
-			logger::write("info", "!! MH_EnableHook(%s @ %p) failed: %s (%d)",
-				what ? what : "?", (void*)address, MH_StatusToString(en), (int)en);
+			logger::write("info", "!! MH_EnableHook(%s @ %p) failed after %d attempt(s): %s (%d)",
+				what ? what : "?", (void*)address, tries + 1, MH_StatusToString(en), (int)en);
 			return false;
 		}
+
+		// Worth one line: a hook that needed several goes is the signature of a
+		// process too busy to snapshot, and that is a timing problem rather than
+		// anything wrong with the hook itself.
+		if (tries > 0)
+			logger::write("info",
+				"   %s: thread snapshot lost the race %d time(s) before the hook took",
+				what ? what : "hook", tries);
+
 		return true;
 	}
 

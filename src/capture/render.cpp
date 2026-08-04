@@ -78,6 +78,24 @@ namespace render
 		double s_slideStep   = 0.0;  // clip ms one present covers, smoothed
 		bool  s_slideCalib   = false;// AUTO has taken its measurement
 		int   s_slideWarm    = 0;    // presents spent measuring before frame 0
+		bool  s_slideToldReach = false; // reported an unreachable shutter, once
+
+		// REAL milliseconds between presents, smoothed. Not clip time.
+		//
+		// s_slideStep answers "how much clip time did that present cover", which
+		// is only meaningful once you know the speed that was actually in force -
+		// and during warm-up you do not. playbackSetSpeed does not take effect on
+		// the present that issues it, so the early deltas are still at whatever
+		// the clip was running at before, and dividing them by the speed we MEANT
+		// to set reports nonsense: a measurement at 1.0x divided by an intended
+		// 0.005x said one present covered 1387ms of clip.
+		//
+		// The feasibility question - can N presents span this shutter at 1.0x -
+		// is really a question about wall-clock, because at 1.0x clip time and
+		// real time advance together. So ask wall-clock directly and the speed
+		// stops mattering.
+		double        s_slideRealStep = 0.0;
+		long long     s_slideLastQpc  = 0;
 
 		// sampleCount handed to the addon for a sample that is NOT the last one.
 		// It only has to exceed the index, since the addon averages and writes on
@@ -127,6 +145,49 @@ namespace render
 		// catching up is rationed.
 		constexpr double kSlideTargetLo = 0.05;
 		constexpr double kSlideTargetHi = 1.75;
+
+		// --- ONE SAMPLE ---------------------------------------------------------
+		// How much clip time a single present may cover, as a fraction of the
+		// output frame interval, when there is no exposure to spread.
+		//
+		// At one sample there is no span to regulate - the frame is an instant -
+		// so the only thing left to hold is WHERE that instant lands on the grid.
+		// The advance phase waits for an absolute mark, so the error per frame is
+		// bounded by whatever one present advances and never compounds; this is
+		// what bounds it. A quarter of a frame keeps the landing within 25% of its
+		// slot while letting the clip run as fast as that allows.
+		//
+		// This used to be 0.1 AND the controller was skipped entirely at one
+		// sample, which is what made no-blur sliding pathologically slow: ten
+		// presents per output frame, and the deliberate 0.35x calibration bias -
+		// which exists ONLY because "the controller will climb it back" - was
+		// never climbed back by a controller that never ran. Measured at ~0.17x,
+		// i.e. a ten-second clip taking over three minutes.
+		constexpr double kSlideStep1 = 0.25;
+
+		// How much of the one-sample step correction to apply per frame.
+		//
+		// Damped, because the thing being measured is both LAGGING and BIMODAL.
+		// s_slideStep is an exponential average, so it is still reporting the
+		// previous speed for a frame or two after a change; and the presents it
+		// averages are not alike - the one that captures carries a full read-back
+		// and runs several times slower than the ones that merely advance. Full
+		// gain against that produced a clean limit cycle: speed hunting
+		// 0.18x..1.0x every six frames, the measurement chasing it one step
+		// behind, and the render taking longer than a steady speed would.
+		//
+		// Same reasoning as kSlideDriftGain, which damps the multi-sample loop
+		// for the same class of reason.
+		constexpr double kSlideStepGain = 0.35;
+
+		// Ceiling on the automatic sample raise above.
+		//
+		// The figure is derived from a live measurement, so a pathological one -
+		// a present rate collapsing during warm-up, a stalled clock - must not be
+		// able to turn "2 samples" into a four-figure render. 64 is the shipped
+		// default and already expensive; anything past it is a measurement fault
+		// rather than a real requirement.
+		constexpr int kSlideMaxAutoSamples = 64;
 
 		// Project time is OURS; the game seeks in the current clip's own time.
 		// s_clipBase is where the live clip starts in its timeline, s_clipProjAt
@@ -1039,6 +1100,11 @@ namespace render
 				s_slideStep   = 0.0;
 				s_slideCapture = false;
 				s_slideLogged = 0;
+				s_slideToldReach = false;
+				// Per render, like everything else here: a present interval carried
+				// over from the previous one would be measured on a different scene.
+				s_slideRealStep  = 0.0;
+				s_slideLastQpc   = 0;
 				game::playbackSetSpeed(s_slideSpeed);
 				game::playbackPlay();
 				s_lastClock = -1.0f;
@@ -1138,16 +1204,35 @@ namespace render
 		if (!begin(now, frames, openEnded, reason)) return false;
 		s_fromExport = true;
 
+		// Capture mode and shutter belong on this line. Without them a log shows
+		// "1 sample(s)" and a render that took three minutes, with nothing to say
+		// whether that was walking being slow or sliding being broken - and those
+		// have completely different causes. Reconstructing it from the ini is not
+		// the same thing: the ini is what it says NOW, not what that render ran.
+		const char* const mode = (s_cfg.captureMode == 1) ? "sliding" : "walking";
+
+		// No shutter angle when there is no blur. Printing "1 sample(s) @ 360 deg"
+		// states a setting that reaches nothing, and a log that reports inactive
+		// settings as if they applied is how an afternoon gets spent wondering why
+		// changing one made no difference.
+		char blur[64];
+		if (s_cfg.samples > 1)
+			snprintf(blur, sizeof(blur), "%d sample(s) @ %.0f deg",
+				s_cfg.samples, s_cfg.shutter * 360.0f);
+		else
+			snprintf(blur, sizeof(blur), "no motion blur");
+
 		if (openEnded)
 			logger::write("info",
-				"render: export started at %.2fs @ %.3g fps, %d sample(s), replayMode=%d -> %s",
-				now * 0.001f, s_cfg.fps, s_cfg.samples, s_startMode, s_folder);
+				"render: export started at %.2fs @ %.3g fps, %s, %s, "
+				"replayMode=%d -> %s",
+				now * 0.001f, s_cfg.fps, mode, blur, s_startMode, s_folder);
 		else
 			logger::write("info",
-				"render: export started at %.2fs @ %.3g fps, %d sample(s), %d clip(s), "
-				"%d frames (%.2fs, %s), replayMode=%d -> %s",
-				now * 0.001f, s_cfg.fps, s_cfg.samples, s_clipN, frames,
-				totalMs * 0.001f, source, s_startMode, s_folder);
+				"render: export started at %.2fs @ %.3g fps, %s, %s, "
+				"%d clip(s), %d frames (%.2fs, %s), replayMode=%d -> %s",
+				now * 0.001f, s_cfg.fps, mode, blur,
+				s_clipN, frames, totalMs * 0.001f, source, s_startMode, s_folder);
 		return true;
 	}
 
@@ -1221,13 +1306,20 @@ namespace render
 
 			// 2. Someone patching over our Open detour. Silent today: MinHook
 			//    reported success, the log said "hooked", and the bytes are gone.
+			//
+			//    Only meaningful once the detour was actually WRITTEN. Reported
+			//    without that check it blamed another mod for a hook that had
+			//    simply failed to install - which is a different problem with a
+			//    different fix, and the install failure has already said so
+			//    several hundred lines earlier.
 			static bool s_saidClobbered = false;
-			if (!s_saidClobbered && game::addr_PlaybackOpen && !exporthook::hookIntact())
+			if (!s_saidClobbered && game::addr_PlaybackOpen &&
+			    exporthook::hookInstalled() && !exporthook::hookIntact())
 			{
 				s_saidClobbered = true;
 				logger::write("info",
-					"export: !! our Open detour is no longer at %p - another mod has "
-					"patched over it. Export will not reach RE+.",
+					"export: !! our Open detour is no longer at %p - it installed and "
+					"something has since patched over it. Export will not reach RE+.",
 					(void*)game::addr_PlaybackOpen);
 			}
 
@@ -1286,6 +1378,35 @@ namespace render
 					}
 				}
 			}
+		}
+
+		// An Export press that arrived while a render was ALREADY running.
+		//
+		// pending() is only consumed by the block below, and that block requires
+		// Idle - so a press during a render was latched and then fired the instant
+		// the render ended, starting a second one nobody asked for. From that
+		// point the cycle is permanently offset: every later press is absorbed by
+		// the phantom already running, its frames land in the PREVIOUS press's
+		// folder, and the newest folder in Captures is always the phantom - a
+		// zero-byte wav and no frames.
+		//
+		// That is exactly the "the render produced nothing" report. It is not the
+		// render that is broken; it is which folder the output went to.
+		//
+		// DROPPED, not queued. The phantom starts from wherever the finished
+		// render left the playhead - the end of the last clip - so it has nothing
+		// left to render even in principle, and two exports back to back is never
+		// what the press meant.
+		if (s_step != Step::Idle && exporthook::pending())
+		{
+			exporthook::clearPending();
+			s_pendWait = 0;
+			s_pendStart = 0;
+			logger::write("info",
+				"export: Export pressed while a render was already running "
+				"(%d/%d frames) - ignoring the press, the render in progress "
+				"continues. Press it again once this one finishes.",
+				s_frame, s_frames);
 		}
 
 		// A diverted Export lands here: Open() has returned, but playback needs
@@ -1823,20 +1944,61 @@ namespace render
 				// difference into the next cycle. Absolute, so it does not matter how
 				// the error arose, and self-correcting rather than merely
 				// non-compounding.
+				// What ONE exposure could span with the throttle wide open.
+				//
+				// s_slideStep is clip-ms per present at the CURRENT speed, so
+				// dividing it out gives the per-present step at 1.0x - the fastest
+				// the clip can legally move. Multiply by the sample count and that
+				// is the widest shutter this mode can actually deliver here.
+				//
+				// Needed because the controller below was written assuming the
+				// requested exposure is always reachable. It is not: covering
+				// dt*shutter across N presents needs speed = dt*shutter/(N*step),
+				// which at a low sample count and a wide shutter exceeds 1.0 and
+				// cannot be had. Asking anyway made the loop oscillate between the
+				// speed floor and ceiling - measured swinging 0.04x..0.84x at two
+				// samples, which is both wrong and glacial.
+				const double perPresentFull = (s_slideSpeed > 0.0f)
+					? s_slideStep / (double)s_slideSpeed : s_slideStep;
+
 				if (s_cfg.samples > 1)
 				{
 					const double want     = (double)s_dt * (double)s_cfg.shutter;
+					const double reach    = perPresentFull * (double)s_cfg.samples;
 					const double consumed = s_slideTime - s_slideMark;
 
-					// s_frame is still the frame just exposed - it is incremented below -
-					// so this is that frame's own slot on the grid.
-					const double idealEnd = (double)s_frame * (double)s_dt + want;
-					const double drift    = s_slideTime - idealEnd;   // + = running ahead
+					// HOW LATE THIS FRAME'S EXPOSURE OPENED. That is the whole pacing
+					// error, and it is the only one worth correcting.
+					//
+					// This used to be `s_slideTime - (f*dt + want)` - where the
+					// exposure ENDED against where a full-length one would have. That
+					// conflates two unrelated things: which slot the frame occupies
+					// (f*dt, a pacing fact) and how long its exposure ran (a blur
+					// setting). They coincide only at a 360-degree shutter that the
+					// clip can actually keep up with.
+					//
+					// When it cannot - two samples at 360 degrees needs the clip at 2x
+					// and 1.0x is the ceiling - the exposure is structurally shorter
+					// than `want` forever, so that expression reported a huge standing
+					// error that no amount of speed could remove. The loop answered by
+					// slamming the speed to the floor, the advance phase then crawled,
+					// the absolute grid eventually dragged it back, and it repeated:
+					// clip time surging and stalling against a steady frame count,
+					// which is exactly a SPEED-RAMPED output.
+					//
+					// Measuring the OPEN instead is immune to all of that. Never
+					// negative - the advance waits for the absolute mark, so a frame
+					// can open late but never early - and unaffected by an exposure
+					// that had to be cut short.
+					const double lateness = s_slideMark - (double)s_frame * (double)s_dt;
 
 					// Half the drift, not all of it. One frame's clock reading is
 					// quantised by the present that carried it, so this is a noisy
 					// measurement; correcting it in full chases the noise and rings.
-					double target = want - drift * kSlideDriftGain;
+					// Opened late: shorten the next exposure so the advance reaches the
+					// following mark sooner and the lateness is paid back. Opened on
+					// time: leave it alone.
+					double target = want - lateness * kSlideDriftGain;
 
 					// Asymmetric on purpose. The two directions are not equivalent:
 					// running BEHIND is absorbed by the advance wait and costs nothing,
@@ -1848,6 +2010,13 @@ namespace render
 					const double hi = want * kSlideTargetHi;
 					if (target < lo) target = lo;
 					if (target > hi) target = hi;
+
+					// Never demand more than the mode can reach. Without this the
+					// ratio below is chasing a span the clip physically cannot
+					// cover, so it pins the speed at the ceiling, overshoots the
+					// grid, and the drift term then slams it to the floor - the
+					// oscillation, in one line.
+					if (reach > 0.0 && target > reach) target = reach;
 
 					// Proportional, and it replaces the old two-regime nudge outright.
 					// That version corrected nothing at all inside a +/-15% band, which is
@@ -1872,8 +2041,64 @@ namespace render
 						s_slideLogged = shown;
 						logger::write("info",
 							"render: sliding - %d sample(s) spanned %.1fms of a %.1fms "
-							"shutter, drift %+.1fms; speed now %.4gx",
-							s_cfg.samples, consumed, want, drift, s_slideSpeed);
+							"shutter, opened %+.1fms late; speed now %.4gx",
+							s_cfg.samples, consumed, want, lateness, s_slideSpeed);
+					}
+
+					// Say it ONCE when the requested shutter is out of reach.
+					// Silently delivering a shorter exposure than asked for is the
+					// kind of thing someone only discovers by comparing two
+					// renders, and the remedy is a setting they already have.
+					if (!s_slideToldReach && reach > 0.0 && want > reach * 1.15)
+					{
+						s_slideToldReach = true;
+						logger::write("info",
+							"render: sliding cannot reach a %.1fms shutter with %d sample(s) "
+							"- the clip would have to run at %.2gx and 1.0x is the limit, so "
+							"the exposure tops out near %.1fms (about %.0f degrees). Raise "
+							"Motion Blur, or use Walking, which places samples by seeking "
+							"and has no such limit.",
+							want, s_cfg.samples, want / (reach > 0.0 ? reach : 1.0),
+							reach, 360.0 * reach / (double)s_dt);
+					}
+				}
+				else
+				{
+					// ONE SAMPLE: an instant, not an exposure.
+					//
+					// There is no span to regulate, so the old code simply skipped
+					// the controller - and with it the correction that the 0.35x
+					// calibration bias depends on, leaving the clip crawling at a
+					// speed nothing would ever raise. What still matters at one
+					// sample is WHERE the instant lands, so steer the per-present
+					// step instead of the exposure: hold it to a fraction of the
+					// frame interval and the grid stays tight while the clip runs
+					// as fast as that allows.
+					const double wantStep = (double)s_dt * kSlideStep1;
+					if (s_slideStep > 0.0)
+					{
+						double k = wantStep / s_slideStep;
+						if (k < 0.1) k = 0.1;
+						if (k > 4.0) k = 4.0;
+
+						// Toward the ratio, not all the way to it - see
+						// kSlideStepGain.
+						k = 1.0 + (k - 1.0) * kSlideStepGain;
+						s_slideSpeed = (float)((double)s_slideSpeed * k);
+					}
+
+					if (s_slideSpeed < 0.001f) s_slideSpeed = 0.001f;
+					if (s_slideSpeed > 1.0f)   s_slideSpeed = 1.0f;
+					game::playbackSetSpeed(s_slideSpeed);
+
+					const int shown = (int)(s_slideSpeed * 10000.0f);
+					if (shown != s_slideLogged)
+					{
+						s_slideLogged = shown;
+						logger::write("info",
+							"render: sliding - no blur, one present covers %.1fms of a "
+							"%.1fms frame; speed now %.4gx",
+							s_slideStep, (double)s_dt, s_slideSpeed);
 					}
 				}
 
@@ -1914,6 +2139,28 @@ namespace render
 				s_spinnerSeen = false;
 				s_lastClock   = -1.0f;
 				return;
+			}
+
+			// Wall-clock between presents. QueryPerformanceCounter, not
+			// GetTickCount: presents here are ~7ms apart and GetTickCount's
+			// resolution is ~15ms, which would quantise the answer into
+			// uselessness.
+			{
+				LARGE_INTEGER qpc, freq;
+				if (QueryPerformanceCounter(&qpc) && QueryPerformanceFrequency(&freq) &&
+				    freq.QuadPart > 0)
+				{
+					if (s_slideLastQpc != 0)
+					{
+						const double ms = 1000.0 * (double)(qpc.QuadPart - s_slideLastQpc)
+						                / (double)freq.QuadPart;
+						// Reject a hitch or a breakpoint; keep the ordinary spread.
+						if (ms > 0.0 && ms < 500.0)
+							s_slideRealStep = (s_slideRealStep <= 0.0)
+								? ms : s_slideRealStep * 0.8 + ms * 0.2;
+					}
+					s_slideLastQpc = qpc.QuadPart;
+				}
 			}
 
 			const float clock = *(float*)game::addr_g_ReplayTimeMs;
@@ -1978,9 +2225,71 @@ namespace render
 
 				s_slideCalib = true;
 
+				// -----------------------------------------------------------------
+				// RAISE THE SAMPLE COUNT TO WHAT SLIDING CAN ACTUALLY PACE.
+				//
+				// At a wide shutter the exposure IS the frame - there is no advance
+				// phase left to absorb anything - so N presents have to cover
+				// dt*shutter exactly, at a speed of at most 1.0x:
+				//
+				//     N >= dt * shutter / (clip ms one present covers at 1.0x)
+				//       =  shutter * presentFPS / outputFPS
+				//
+				// Below that it is not a tuning problem, it is arithmetic: two
+				// presents cannot span 33.3ms unless the clip runs at 2x, and 1.0x
+				// is the ceiling. The controller can then only choose which way to
+				// be wrong, and what it chose was to slam the speed to the floor,
+				// let the absolute grid drag it back, and repeat - clip time surging
+				// and stalling against a steady frame count, i.e. a SPEED-RAMPED
+				// output. Measured opening 130ms late on a six-frame cycle.
+				//
+				// So raise it. This is not a compromise: more samples at the same
+				// shutter is the SAME exposure, sampled more finely - the user gets
+				// the 360 degrees they asked for, correctly paced, instead of an
+				// effective 183 and a ramp. It costs presents, which is the thing
+				// sliding spends anyway.
+				//
+				// MEASURED, not tabled. The figure depends on the present rate,
+				// which is the machine and the scene: 144fps into 30fps needs 5,
+				// the same box into 60fps needs 3, a 45fps laptop needs 2. A
+				// hardcoded floor would be wrong in both directions.
+				if (s_cfg.samples > 1 && s_slideRealStep > 0.0)
+				{
+					// At 1.0x, clip time and wall-clock advance together - so the
+					// real interval between presents IS the most clip time one
+					// present can cover. Measured, and immune to the speed not
+					// having taken effect yet.
+					const double stepAtFull = s_slideRealStep;
+					const double needSpan   = (double)s_dt * (double)s_cfg.shutter;
+
+					// +1 of headroom: landing exactly on 1.0x leaves the controller
+					// no room to correct upwards when a present runs long.
+					int need = (int)ceil(needSpan / stepAtFull) + 1;
+					if (need > kSlideMaxAutoSamples) need = kSlideMaxAutoSamples;
+
+					if (need > s_cfg.samples)
+					{
+						logger::write("info",
+							"render: sliding needs at least %d sample(s) here and %d were "
+							"set - raising it. Presents are %.2fms apart, so at 1.0x that "
+							"is the most clip time one can cover; %d could only span "
+							"%.1fms of a %.1fms shutter and the clip would have to run at "
+							"%.2gx, with 1.0x the limit. Fewer samples than this cannot be "
+							"PACED, not merely under-blurred - it comes out speed-ramped. "
+							"Walking has no such floor.",
+							need, s_cfg.samples, stepAtFull, s_cfg.samples,
+							stepAtFull * s_cfg.samples, needSpan,
+							needSpan / (stepAtFull * s_cfg.samples));
+						s_cfg.samples = need;
+					}
+				}
+
+				// At one sample the target is a per-present STEP, not an exposure,
+				// and it has to be the same number the controller steers to or the
+				// two pull against each other for the first few frames.
 				const int    n    = s_cfg.samples < 1 ? 1 : s_cfg.samples;
 				const double want = (n > 1) ? (double)s_dt * (double)s_cfg.shutter
-				                            : (double)s_dt * 0.1;
+				                            : (double)s_dt * kSlideStep1;
 				const double have = s_slideStep * (double)n;
 				if (have > 0.0)
 				{

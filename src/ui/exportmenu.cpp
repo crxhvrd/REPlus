@@ -519,9 +519,24 @@ namespace exportmenu
 				       "strobes on anything moving quickly. This is also the setting that "
 				       "costs the render: every sample is a full redraw, so 64 samples is "
 				       "roughly 64 times the render time of Off. 32 to 64 is the usual "
-				       "answer.";
+				       "answer.\n\n"
+				       "Sliding has a FLOOR here and will raise this on its own if you go "
+				       "under it. The exposure is spread across presented frames, so it "
+				       "needs about (present rate / frame rate) samples to cover the "
+				       "shutter at all - roughly 5 at 144fps into 30. Below that it cannot "
+				       "be paced and the render comes out speed-ramped, so the count is "
+				       "raised and noted in the log. Walking places its samples by seeking "
+				       "and has no such floor.";
 
 			case ROW_SHUTTER:
+				// Depends on MOTION BLUR, not on itself - so the pane is correct
+				// as soon as you arrive here, which is the rule in rowHelp's note.
+				if (c.renderSamples <= 1)
+					return "Inactive: with Motion Blur off there is nothing to spread an "
+					       "exposure across, so the shutter reaches nothing at all - each "
+					       "frame is a single instant.\n\n"
+					       "Set Motion Blur to 2 samples or more to bring this live.";
+
 				return "How much of each frame interval the shutter is open, spread across "
 				       "the sub-samples above.\n\n"
 				       "0.50 is a 180 degree shutter, the film convention, and reads as "
@@ -530,6 +545,12 @@ namespace exportmenu
 				       "sample count says. No effect while Motion Blur is Off.";
 
 			case ROW_HIGHLIGHT:
+				if (c.renderSamples <= 1)
+					return "Inactive: this lifts highlights WHILE sub-samples are "
+					       "accumulated, and with Motion Blur off nothing is accumulated - "
+					       "the frame is captured and written straight out.\n\n"
+					       "Set Motion Blur to 2 samples or more to bring this live.";
+
 				return "Lifts highlights while the sub-samples are accumulated.\n\n"
 				       "A plain average pulls every specular hit down towards the mean, so "
 				       "highlights that should streak end up as grey mush - the more "
@@ -720,8 +741,25 @@ namespace exportmenu
 		// since the sound survives however you choose to encode later.
 		bool rowEnabled(int row)
 		{
+			const Config& c = Config::get();
+
 			if (row == ROW_ENABLE) return true;
-			return Config::get().enableRenderer;
+			if (!c.enableRenderer)  return false;
+
+			// Shutter and Highlight Boost are ACCUMULATION settings, and with
+			// Motion Blur off there is no accumulation to apply them to. Not
+			// "mostly ignored" - unreachable, in all three places at once:
+			// walking places its single sample at t and never multiplies by the
+			// shutter, sliding's one-sample path steers a per-present step
+			// instead, and the add-on takes a `sampleCount <= 1` branch that
+			// writes the frame straight out without ever building an accumulator.
+			//
+			// Leaving them steppable is the same lie the stock encoder rows tell
+			// when the renderer owns Export, and it gets the same treatment.
+			if ((row == ROW_SHUTTER || row == ROW_HIGHLIGHT) && c.renderSamples <= 1)
+				return false;
+
+			return true;
 		}
 
 		// =====================================================================
