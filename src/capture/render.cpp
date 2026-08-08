@@ -34,6 +34,10 @@ namespace render
 
 		Settings s_cfg;
 
+		// A settings change arrived while a render was running and was withheld
+		// from s_cfg. Replayed by finish(), so the next render gets it.
+		bool s_cfgDirty = false;
+
 		Step  s_step   = Step::Idle;
 		int   s_frame  = 0;      // output frame index
 		int   s_frames = 0;      // total output frames
@@ -430,13 +434,17 @@ namespace render
 		// guarantees it regardless of which movie or which system put it there.
 		//
 		// Gated on renderHideHud so it stays opt-out, and on s_step so normal
-		// editor use is untouched. Runs on the RENDER thread - keep it trivial.
+		// editor use is untouched. Reached from BOTH the main and the render
+		// thread - the same function does the param update and the draw, picked
+		// by a per-thread flag - so keep it trivial.
 		// -------------------------------------------------------------------------
-		using FnRenderMovie = void(__fastcall*)(int, void*, void*, int, int, int, int);
-		FnRenderMovie origRenderMovie = nullptr;
+		using FnDrawMovie = void(__fastcall*)(unsigned int, void*, void*, void*, void*,
+		                                      unsigned int, unsigned int, char, char);
+		FnDrawMovie origDrawMovie = nullptr;
 
-		void __fastcall hkRenderMovie(int movieId, void* pos, void* scale,
-		                              int a, int b, int c, int d)
+		void __fastcall hkDrawMovie(unsigned int movieId, void* pos, void* scale,
+		                            void* depth, void* colour,
+		                            unsigned int a, unsigned int b, char c, char d)
 		{
 			// A captured frame should carry no UI, whichever movie or system put
 			// it there. This is the one place that guarantees it.
@@ -448,7 +456,7 @@ namespace render
 			const bool capturing = (s_step != Step::Idle) || dofsession::active();
 			if (capturing && Config::get().renderHideHud) return;
 
-			origRenderMovie(movieId, pos, scale, a, b, c, d);
+			origDrawMovie(movieId, pos, scale, depth, colour, a, b, c, d);
 		}
 
 		uint32_t s_lastBeat = 0;
@@ -699,6 +707,26 @@ namespace render
 
 		void finish(const char* why, bool complete)
 		{
+			// Ten call sites pass complete=true and only two of them are "reached
+			// the target frame count" - the rest are early exits that the clock,
+			// the clip walk or the project wrap decided for us. Every one of them
+			// used to read as an unqualified success, so a video that stopped at
+			// 60 frames of 87 was signed off as finished and the shortfall had to
+			// be spotted by eye in the frame numbers.
+			//
+			// Said once, here, rather than at each site: whatever the reason, a
+			// short render is worth its own line.
+			if (complete && !s_audioPass && s_frames > 0 &&
+			    s_frame < s_frames - s_frames / 20)
+			{
+				logger::write("info",
+					"render: STOPPED SHORT at %d of %d frames (%s) - the video is "
+					"complete only up to that point. Something ended playback early: "
+					"a held clock, a clip that would not step, or a frame count that "
+					"was over-estimated for this project.",
+					s_frame, s_frames, why);
+			}
+
 			s_step = Step::Idle;
 
 			// Unconditional: an aborted render must not leave the editor with a
@@ -821,6 +849,15 @@ namespace render
 			logger::write("info", "render: %s (%d/%d frames, %d clip(s), spinnerHits=%u, %s)",
 				why, s_frame, s_frames, s_clipN ? s_clipAt + 1 : 0, s_spinnerHits, s_folder);
 			s_spinnerHits = 0;
+
+			// A settings change that arrived mid-render was withheld from s_cfg;
+			// now is when it can safely land. applyConfig() re-reads Config itself,
+			// so this needs no copy of what changed - only that something did.
+			if (s_cfgDirty)
+			{
+				logger::write("info", "render: applying the settings changed during the render");
+				applyConfig();
+			}
 		}
 
 		// A requested clip step has arrived. Re-establish the render's own
@@ -914,15 +951,16 @@ namespace render
 				"render: spinner draw unresolved - the editor's spinner stays");
 		}
 
-		if (game::addr_ScaleformRenderMovie)
+		if (game::addr_ScaleformDrawMovie)
 		{
-			memory(game::addr_ScaleformRenderMovie).hook(hkRenderMovie, &origRenderMovie, "ScaleformRenderMovie");
+			memory(game::addr_ScaleformDrawMovie).hook(hkDrawMovie, &origDrawMovie, "ScaleformDrawMovie");
 			logger::write("info", "render: scaleform movie rendering suppressed during capture");
 		}
 		else
 		{
 			logger::write("info",
-				"render: CScaleformMgr::RenderMovie unresolved - UI movies may be captured");
+				"render: the scaleform movie draw is unresolved - UI, including a "
+				"warning screen, may be captured");
 		}
 
 		if (game::addr_BusySpinnerOn)
@@ -960,6 +998,32 @@ namespace render
 	void applyConfig()
 	{
 		const Config& c = Config::get();
+
+		// s_cfg IS THE RUNNING RENDER'S SNAPSHOT. Never rewrite it under one.
+		//
+		// This is called from the export menu's row handler, which the editor also
+		// runs while a render is in flight - so pressing Export again, or nudging
+		// any render row, replaced the settings of a render already six frames in.
+		// Observed: a 128-sample render became a 32-sample one mid-flight, the
+		// speed controller fell back to its calibration seed against a shutter it
+		// had never measured, ten frames came out with the clip clock frozen, and
+		// the file finished 30/30 and was unusable. Nothing reported a problem
+		// because from every subsystem's point of view the numbers were valid -
+		// they were simply not the ones the render started with.
+		//
+		// The edit is not lost. s_cfgDirty replays it the moment the render goes
+		// idle, which is also when changing it can mean anything.
+		if (active())
+		{
+			s_cfgDirty = true;
+			logger::write("info",
+				"render: settings changed while a render is running (%d/%d frames) - "
+				"the render keeps the settings it started with; the new ones apply to "
+				"the next one.", s_frame, s_frames);
+			return;
+		}
+		s_cfgDirty = false;
+
 		s_cfg.fps          = c.renderFps;
 		s_cfg.samples      = c.renderSamples;
 		s_cfg.shutter      = c.renderShutter;
@@ -1332,8 +1396,52 @@ namespace render
 		finish("cancelled", false);
 	}
 
+	// Escape stops the render.
+	//
+	// cancel() existed, was declared in the header, and had no caller anywhere,
+	// so a running render could not be stopped at all. Escape therefore went
+	// where it always goes - to the editor, which asks whether to leave for the
+	// Project Menu - and the render carried on behind that dialog, accumulating
+	// it into every frame until the question was answered.
+	//
+	// The key is not consumed (there is no input hook), so the editor still gets
+	// it and still asks. Harmless once we stop first: the render is over before
+	// the dialog is drawn, so no frame can contain it, and answering "No" just
+	// returns to a cancelled render.
+	//
+	// Foreground-checked, because GetAsyncKeyState is global and a render is
+	// exactly when someone alt-tabs away - an Escape pressed in another window
+	// must not reach this. Edge-triggered so a held key fires once.
+	bool escapePressed()
+	{
+		static bool down = false;
+
+		bool now = false;
+		if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0)
+		{
+			DWORD pid = 0;
+			GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+			now = (pid == GetCurrentProcessId());
+		}
+
+		const bool edge = now && !down;
+		down = now;
+		return edge;
+	}
+
 	void pump()
 	{
+		// Polled every frame, not only while rendering, so the held/released
+		// state stays true across a render boundary and the first Escape of the
+		// next render is still an edge.
+		const bool escape = escapePressed();
+		if (active() && escape)
+		{
+			logger::write("info", "render: Escape at frame %d/%d - cancelling", s_frame, s_frames);
+			cancel();
+			return;
+		}
+
 		// --- export diagnostics ------------------------------------------
 		//
 		// "I pressed Export, it rendered the vanilla watermarked video, and the
@@ -2445,11 +2553,27 @@ namespace render
 					game::playbackSetSpeed(s_slideSpeed);
 				}
 
-				// The warm-up was pre-roll, not output time. Rebasing here means
-				// frame 0 starts from wherever the measurement left the playhead
-				// instead of carrying a head offset for the whole render.
+				// The warm-up was pre-roll, not output time - so rewind it.
+				//
+				// It used to only rebase the clock and let frame 0 start from
+				// wherever the measurement had left the playhead. That silently ate
+				// the HEAD of the clip: the warm-up plays at the seed speed while it
+				// measures, and everything it consumed was simply never rendered.
+				// The frame count comes from the whole clip, so the render then ran
+				// off the end early and the shortfall looked like a stopping bug.
+				//
+				// Measured on a 1154 ms clip: 22 frames of 30, video 0.92s against
+				// 1.18s of audio, and the first ~237 ms of the action missing. It
+				// scales with clip length, which is why it hid for so long - on a
+				// 30-second shot the same 237 ms is a rounding error.
+				//
+				// One seek, and only here: the playhead goes back to where frame 0
+				// belongs before anything is exposed. Sliding avoids seeking DURING
+				// the exposure, which this is not - it is the same seek begin()
+				// already does, repeated now that the speed is known.
 				s_slideTime = 0.0;
 				s_lastClock = -1.0f;   // the next delta belongs to the new speed
+				game::jumpProjectTo(seekTime(), 0);
 				return;
 			}
 

@@ -1793,22 +1793,34 @@ namespace gsig
 	// Both prologues verified unique in their own image.
 	// -------------------------------------------------------------------------
 	// -------------------------------------------------------------------------
-	// CScaleformMgr::RenderMovie(int movieId, Vector2* pos, Vector2* scale, ...)
-	//   enh 0x5EA6B0
+	// The Scaleform movie draw.   enh 0x6947E0   leg 0x16294C
 	//
 	// The point every Scaleform movie goes through to reach the screen. This is
-	// the layer BELOW method calls, and it is the only one left that can reach a
-	// movie which was configured earlier and then animates itself in
-	// ActionScript - such a movie issues no native calls at all while it draws,
-	// which an always-on log of BeginMethod proved: during a full render with the
-	// ring on screen, ZERO Scaleform methods were invoked.
+	// the layer BELOW method calls, and it is the only one that can reach a movie
+	// which was configured earlier and then animates itself in ActionScript - such
+	// a movie issues no native calls at all while it draws, which an always-on log
+	// of BeginMethod proved: during a full render with the ring on screen, ZERO
+	// Scaleform methods were invoked.
 	//
-	// Found without a new hunt: CBusySpinner::Render (already resolved) calls it
-	// as RenderMovie(ms_iSpinnerMovie, &pos, &scale{1,1}, ...), sitting between
-	// the IsMovieActive and IsMovieRendering pair.
+	// TWO EARLIER MISTAKES ARE WORTH KEEPING HERE, because each one shipped.
 	//
-	// Legacy is left empty deliberately - its renders come out clean, so there is
-	// nothing there to suppress.
+	// 1. The 7-arg public RenderMovie(id, &pos, &scale, ...) was hooked instead of
+	//    this. It is one of fifteen routes in, and NOT the one the warning screen
+	//    takes - that goes through a no-argument sibling which renders a singleton
+	//    movie id, applies SET_PADDING off an aspect-ratio safe-zone table, and
+	//    calls straight in here. So "return to the Project Menu?" was composited
+	//    into renders on a build where the wrapper hook was installed and logged
+	//    as working. Hook the callee; every route ends here.
+	//
+	// 2. Legacy was left empty on the reasoning that its renders "come out clean".
+	//    That was never verified - it was inferred from nobody reporting UI in a
+	//    Legacy render, which only meant nobody had raised a warning screen during
+	//    one. An unresolved pattern is an open hole, not evidence of a clean build.
+	//
+	// Found from the BUSY_SPINNER string: its xrefs write the spinner's movie-id
+	// global, the one function reading that global six times is CBusySpinner::Render,
+	// and the 7-arg call inside it is the public RenderMovie - whose single callee
+	// is this.
 	// -------------------------------------------------------------------------
 	// -------------------------------------------------------------------------
 	// The animated spinner's actual DRAW, one level under RenderAnimatedSpinner
@@ -1839,10 +1851,29 @@ namespace gsig
 		"48 8D 68 A9 48 81 EC F0 00 00 00"
 	};
 
-	inline constexpr Sig SCALEFORM_RENDERMOVIE = {
-		"48 83 EC 78 44 8B 94 24 A0 00 00 00 44 0F B6 9C 24 A8 00 00 00 "
-		"0F B6 84 24 B0 00 00 00",
-		""
+	// Every movie's draw, and the reason it is the WORKER and not the 7-arg public
+	// entry that used to be hooked here.
+	//
+	// That entry - (id, &pos, &scale, depth, colour, u8, u8), a thin wrapper that
+	// fills in the default params and calls this - is one of fifteen routes into
+	// this function, not the only one. The warning screen takes a different one: a
+	// no-argument sibling that renders a singleton movie id, applies SET_PADDING
+	// from an aspect-ratio safe-zone table, and calls straight in here. Hooking the
+	// wrapper never saw it, which is why "return to the Project Menu?" was
+	// composited into a render on a build where the wrapper hook WAS installed.
+	//
+	// This function cannot be bypassed: all sixteen routes converge on it, wrapper
+	// included. Same reasoning as DRAW_SPINNER - hook the callee.
+	//
+	// 9 args on both builds: (id, &pos, &scale, &depth, &colour, u32, u32, u8, u8).
+	// It is both the update and the draw, chosen by a per-thread flag, so a capture
+	// suppresses both - which is what we want and what the wrapper hook already did
+	// for the routes it covered.
+	inline constexpr Sig SCALEFORM_DRAWMOVIE = {
+		"41 57 41 56 41 54 56 57 55 53 48 81 EC A0 00 00 00 "
+		"66 44 0F 29 84 24 90 00 00 00 0F 29 BC 24 80 00 00 00 0F 29 74 24 70 85 C9",
+		"85 C9 0F 88 ? ? ? ? 48 8B C4 48 89 58 08 48 89 70 10 48 89 78 18 "
+		"55 41 56 41 57 48 8D 68 C9 48 81 EC B0 00 00 00 0F 29 70 D8"
 	};
 
 	inline constexpr Sig BUSYSPINNER_ON = {
@@ -1856,10 +1887,18 @@ namespace gsig
 	// than trusting the enum, since the source list differs between them.
 	inline constexpr int SPINNER_SOURCE_VIDEO_EDITOR = 5;
 
+	// Its draw goes through SCALEFORM_RENDERMOVIE, so that hook alone already keeps
+	// it out of a captured frame. Kept because this one is NOT conditional on
+	// RenderHideHud: with that off, this is what still holds the ring back, and it
+	// is also what counts the hit into spinnerHits.
+	//
+	// Same role on both builds, different guard - Legacy tests bit 1 of TLS+0x22B4
+	// where Enhanced reads a byte at +0x638.
 	inline constexpr Sig BUSYSPINNER_RENDER = {
 		"56 48 83 EC 50 8B 05 ? ? ? ? 65 48 8B 0C 25 58 00 00 00 "
 		"48 8B 04 C1 80 B8 38 06 00 00 00 75 05 E8",
-		""
+		"48 89 5C 24 18 57 48 83 EC 50 8B 0D ? ? ? ? 65 48 8B 04 25 58 00 00 00 "
+		"BA B4 22 00 00 0F 29 74 24 40 48 8B 04 C8 8B 0C 02 D1 E9 F6 C1 01"
 	};
 
 	inline constexpr Sig VIDEOEDITOR_SHOULDSHOWLOADING = {

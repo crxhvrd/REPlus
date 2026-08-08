@@ -30,7 +30,7 @@ namespace game
 	uintptr_t addr_RenderSpinner       = 0;
 	uintptr_t addr_BusySpinnerRender   = 0;
 	uintptr_t addr_BusySpinnerOn       = 0;
-	uintptr_t addr_ScaleformRenderMovie= 0;
+	uintptr_t addr_ScaleformDrawMovie  = 0;
 	uintptr_t addr_DrawSpinner         = 0;
 	uintptr_t addr_ShouldShowLoading   = 0;
 	uintptr_t addr_g_WantDelayedClose  = 0;
@@ -1019,12 +1019,12 @@ namespace game
 				(uint64_t)(addr_DrawSpinner ? addr_DrawSpinner - memory::base() : 0));
 		}
 
-		if (const char* p = pick(gsig::SCALEFORM_RENDERMOVIE); p && *p)
+		if (const char* p = pick(gsig::SCALEFORM_DRAWMOVIE); p && *p)
 		{
-			addr_ScaleformRenderMovie = memory::scan(p).address;
-			logger::write("info", "  ScaleformRenderMovie = %p (rva 0x%llX)",
-				(void*)addr_ScaleformRenderMovie,
-				(uint64_t)(addr_ScaleformRenderMovie ? addr_ScaleformRenderMovie - memory::base() : 0));
+			addr_ScaleformDrawMovie = memory::scan(p).address;
+			logger::write("info", "  ScaleformDrawMovie   = %p (rva 0x%llX)",
+				(void*)addr_ScaleformDrawMovie,
+				(uint64_t)(addr_ScaleformDrawMovie ? addr_ScaleformDrawMovie - memory::base() : 0));
 		}
 
 		if (const char* p = pick(gsig::BUSYSPINNER_ON); p && *p)

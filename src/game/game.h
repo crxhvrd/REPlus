@@ -32,7 +32,7 @@ namespace game
 	extern uintptr_t addr_RenderSpinner;         // CPauseMenu::RenderAnimatedSpinner
 	extern uintptr_t addr_BusySpinnerRender;     // CBusySpinner::Render - a SECOND spinner
 	extern uintptr_t addr_BusySpinnerOn;         // CBusySpinner::On - where a spinner is RAISED
-	extern uintptr_t addr_ScaleformRenderMovie;  // CScaleformMgr::RenderMovie - every movie's draw
+	extern uintptr_t addr_ScaleformDrawMovie;    // the movie draw itself - all 16 routes end here
 	extern uintptr_t addr_DrawSpinner;           // the spinner's real draw, under RenderAnimatedSpinner
 	extern uintptr_t addr_ShouldShowLoading;     // CVideoEditorInterface::ShouldShowLoadingScreen
 	extern uintptr_t addr_g_WantDelayedClose;    // bool, ms_bWantDelayedClose
