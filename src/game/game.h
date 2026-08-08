@@ -74,6 +74,32 @@ namespace game
 	// leaves a first-person clip stuck with its recorded camera.
 	extern uintptr_t addr_IsPlaybackFlagSet;
 
+	// CReplayMgrInternal::IsWaitingOnWorldStreaming(). The precache's gate, and
+	// the reason the editor stalls between every action on a modded install: it
+	// waits on the GLOBAL streaming request count reaching zero, which a modded
+	// game never does. See signatures.h. Optional; unresolved leaves the stock
+	// 6600-unit (200-frame) wait in place.
+	extern uintptr_t addr_IsWaitingOnWorldStreaming;
+
+	// CReplayMgrInternal::sm_uStreamingStallTimer, derived from the compare that
+	// opens IsWaitingOnWorldStreaming. sm_uAudioStallTimer sits 4 bytes after it
+	// and sm_uStreamingSettleCount 4 after that; precache.cpp validates the
+	// values before writing, because that adjacency is inferred rather than
+	// proven. 0 = unresolved, and the audio half of the fix stays off.
+	extern uintptr_t addr_g_StreamingStallTimer;
+
+	// CReplayAdvanceReader::HandleResults(...). The precache's last unbounded
+	// wait: its answer gates Validate with no give-up timer of any kind, and a
+	// single un-streamable entity holds it for a full 10 s of real
+	// time - an internal timeout, not one the game exposes. Hooked to bound it.
+	// Optional.
+	extern uintptr_t addr_AdvanceReaderHandleResults;
+
+	// CReplayModelManager::LoadModel(...). Hooked only to clamp
+	// m_modelLoadTimeout, which otherwise blocks the main thread for up to five
+	// seconds per un-streamable entity. Optional.
+	extern uintptr_t addr_ModelMgrLoadModel;
+
 	// CReplayBufferInfo. The LIVE block counts live here, and they are not the
 	// configured ones - the temp buffer borrows blocks out of the recording ring
 	// while a save is in flight. See signatures.h for the layout.
@@ -152,6 +178,25 @@ namespace game
 	// all four answer nothing useful outside the editor: clipIndex is -1,
 	// clipCount is 0, and the two range calls return false.
 	//
+	// Real elapsed output time -> the authored (non-dilated) time to seek to.
+	//
+	// Marker speed (5..200%) makes those two clocks diverge. Everything else in
+	// the renderer already works in non-dilated time, so this one conversion is
+	// what makes a slow-motion section render as slow motion rather than at
+	// uniform speed. Returns its input unchanged when the controller is not
+	// available, which is the old behaviour rather than a wrong seek.
+	float dilatedToNonDilatedMs(float dilatedProjectMs);
+
+	// The inverse. Sliding capture lets the clip play and watches the clock, so
+	// what it observes is authored time and has to be mapped onto the output
+	// timeline; Walking seeks, so it needs the other direction. Callers take the
+	// DIFFERENCE of two of these within one clip, which cancels the per-clip base.
+	float nonDilatedToDilatedMs(float nonDilatedProjectMs);
+
+	// Total REAL duration of the project - what the finished video runs for, and
+	// therefore what the output frame count must be derived from. 0 if unknown.
+	float totalDilatedMs();
+
 	// A clip index of -1 means "the one on screen".
 	bool clipRangeAt(int clipIndex, float& lo, float& hi);
 	int  clipIndex();

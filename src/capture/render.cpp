@@ -229,7 +229,12 @@ namespace render
 		// The real-time audio pass. Survives between renders on purpose: it is
 		// what tells the NEXT Export press that a wav is waiting for it.
 		bool        s_audioPass  = false;
-		int         s_audioStall = 0;
+		// When the clip clock was first seen standing still, or 0 while it is
+		// moving. A TICK rather than a present count, because the same count means
+		// 1.5s at 60fps and 0.45s at 200fps - and the fast end truncates takes.
+		// Shared by the audio pass (gate + end) and by sliding's end test, which
+		// all ask the same question.
+		uint32_t    s_clockStillTick = 0;
 		int         s_autoOpen   = 0;   // ticks until the frame pass is started for us
 		std::string s_pendingWav;
 
@@ -481,16 +486,24 @@ namespace render
 		// minute - long enough to ride out a transition that passes through it.
 		constexpr int kExitGuard = 240;
 
-		// Pump ticks of a motionless clock before the audio pass calls it the end
-		// of the project. Roughly a second and a half - long enough not to trip on
-		// a hitch, short enough not to record silence onto the tail.
-		constexpr int kAudioStall = 90;
+		// How long the clip clock may sit still before the audio pass calls it the
+		// end of the project. Long enough not to trip on a hitch, short enough not
+		// to record silence onto the tail.
+		//
+		// MILLISECONDS, not presents. As a present count the same constant meant
+		// 1.5s at 60fps, 9s at 10fps and 0.45s at 200fps - and at the fast end a
+		// brief stall reads as the end of the project, truncating the wav that the
+		// frame pass then takes its length from.
+		constexpr int kAudioStallMs = 1500;
 
 		// Time of the current sub-sample. Samples are spread across the OPEN
 		// part of the frame interval only, which is what shutter angle means:
 		// shutter 0.5 exposes the first half of the interval, so the blur trail
 		// covers half a frame of motion and the rest is dark time.
-		float sampleTime()
+		// Real output time of the current sub-sample, BEFORE dilation is undone.
+		// The render's own clock advances here, uniformly, one frame interval at a
+		// time - that is what makes the output file play at a constant rate.
+		float sampleTimeDilated()
 		{
 			const float base = s_start + (float)s_frame * s_dt;
 
@@ -506,6 +519,29 @@ namespace render
 			// rule and has no such bias.
 			const float open = s_dt * s_cfg.shutter;
 			return base + open * (((float)s_sample + 0.5f) / (float)s_cfg.samples);
+		}
+
+		// The same instant expressed on the AUTHORED timeline - which is what the
+		// rest of this file, and JumpTo, work in.
+		//
+		// Marker speed (5..200%) is the only thing that makes these differ. The
+		// render clock above is uniform, so undoing the dilation here is what
+		// stretches a 50% section across twice as many output frames, i.e. actual
+		// slow motion in the file rather than the section simply playing at full
+		// speed and being over too soon.
+		//
+		// The AUDIO pass needs nothing equivalent: it plays the project through in
+		// real time and records what comes out, so the wav has always carried the
+		// dilation. It was the frame pass that did not - which means this fix
+		// removes an A/V desync on speed-marker projects rather than creating one.
+		//
+		// With no speed markers anywhere, ConvertTimeToNonDilatedTimeMs is the
+		// identity and this returns exactly what sampleTimeDilated() did before.
+		float sampleTime()
+		{
+			const float t = sampleTimeDilated();
+			if (!Config::get().renderMarkerSpeed) return t;
+			return game::dilatedToNonDilatedMs(t);
 		}
 
 		// -------------------------------------------------------------------------
@@ -999,6 +1035,38 @@ namespace render
 			s_dt        = 1000.0f / s_cfg.fps;
 			s_start     = startMs;
 			s_frames    = frames;
+
+			// Is the SUB-SAMPLE step still representable where this render ends?
+			//
+			// The clip clock is a float and so is the seek that consumes it, so
+			// the finest step that means anything is one ULP at the magnitude in
+			// play - and the magnitude is the time INTO the clip, which grows as
+			// the render proceeds. Late in a long clip the ULP is coarse:
+			// ~0.0036ms at 30s, ~0.0076ms at 60s.
+			//
+			// The step between sub-samples is dt*shutter/N, and at a high frame
+			// rate with a high sample count that lands in the same territory.
+			// Nothing errors when it does - consecutive sub-samples simply round
+			// to the same instant and the blur silently stops getting finer, which
+			// is indistinguishable from "this scene has little motion" unless you
+			// know to look. So say it up front rather than let someone conclude
+			// the sample count does nothing.
+			if (s_cfg.samples > 1)
+			{
+				const float endMs = startMs + (openEnded ? 0.0f : (float)frames * s_dt);
+				const float ulp   = (endMs > 1.0f ? endMs : 1.0f) * 1.1920929e-7f; // 2^-23
+				const float step  = s_dt * s_cfg.shutter / (float)s_cfg.samples;
+
+				if (step < ulp * 8.0f)
+				{
+					logger::write("info",
+						"render: sub-sample step is %.5fms but the clip clock only resolves "
+						"~%.5fms this far in (%.1fs) - the last samples of each frame will "
+						"land on the same instant and the blur stops refining. Fewer samples, "
+						"a lower frame rate, or a shorter clip would all fix it.",
+						step, ulp, endMs * 0.001f);
+				}
+			}
 			s_frame     = 0;
 			s_sample    = 0;
 			s_openEnded = openEnded;
@@ -1032,7 +1100,7 @@ namespace render
 				if (audioout::begin(s_folder))
 				{
 					s_audioPass  = true;
-					s_audioStall = 0;
+					s_clockStillTick = 0;
 					s_lastClock  = -1.0f;
 					game::playbackSetSpeed(1.0f);   // ONLY 1.0 - the audio engine
 					game::playbackPlay();           // misbehaves at any other rate
@@ -1063,7 +1131,7 @@ namespace render
 			s_slideTime   = 0.0;
 			s_slideSample = 0;
 			s_slideFlush  = false;
-			s_audioStall  = 0;   // doubles as the sliding clock-stall counter
+			s_clockStillTick = 0;   // doubles as the sliding clock-stall counter
 
 			// Take the editor's HUD down for the duration. Same flag the
 			// hide-HUD key uses, so this is the game's own path - and Open()
@@ -1157,18 +1225,40 @@ namespace render
 		bool        openEnded = true;
 		float       totalMs   = 0.0f;
 
+		// DILATED duration, because the render clock is now dilated too.
+		//
+		// The per-clip spans below are non-dilated - the AUTHORED length - and
+		// those two are the same number only while every marker sits at 100%.
+		// Counting frames from the authored length on a project with a 50% section
+		// asks for half the frames that section needs, and the render stops short
+		// of the end.
 		const int clips = game::clipCount();
-		for (int i = 0; i < clips; ++i)
+		const bool useDilated = Config::get().renderMarkerSpeed;
+
+		if (useDilated) totalMs = game::totalDilatedMs();
+
+		if (totalMs > 1.0f)
 		{
-			float lo = 0.0f, hi = 0.0f;
-			if (game::clipRangeAt(i, lo, hi)) totalMs += hi - lo;
+			source = "from the clip table (real duration)";
+		}
+		else
+		{
+			// Either dilation is switched off, or the controller could not answer.
+			// The authored span is the right answer in the first case and the only
+			// available one in the second.
+			totalMs = 0.0f;
+			for (int i = 0; i < clips; ++i)
+			{
+				float lo = 0.0f, hi = 0.0f;
+				if (game::clipRangeAt(i, lo, hi)) totalMs += hi - lo;
+			}
+			if (totalMs > 1.0f) source = "from the clip table";
 		}
 
 		if (totalMs > 1.0f)
 		{
 			frames    = (int)(totalMs / (1000.0f / s_cfg.fps) + 0.5f) + 2;
 			openEnded = false;
-			source    = "from the clip table";
 		}
 		else if (!s_pendingWav.empty() && audioout::seconds() > 0.05)
 		{
@@ -1638,7 +1728,7 @@ namespace render
 				game::playbackSetSpeed(1.0f);
 				game::playbackPlay();
 				s_lastClock  = -1.0f;   // the new clip's clock has its own base
-				s_audioStall = 0;
+				s_clockStillTick = 0;
 				return;
 			}
 
@@ -1655,7 +1745,7 @@ namespace render
 				game::playbackSetSpeed(s_slideSpeed);
 				game::playbackPlay();
 				s_lastClock  = -1.0f;   // the new clip's clock has its own base
-				s_audioStall = 0;
+				s_clockStillTick = 0;
 				return;
 			}
 
@@ -1794,7 +1884,7 @@ namespace render
 			// dead air on the end of every take - which then became a second and
 			// a half of extra frames, since the frame count comes from this.
 			const bool clean = !game::replayBusy() && mode == s_startMode;
-			audioout::gate(clean && s_audioStall == 0);
+			audioout::gate(clean && s_clockStillTick == 0);
 
 			// Follow the clip index, because on a multi-clip project it is the
 			// only reliable end there is.
@@ -1827,8 +1917,8 @@ namespace render
 			// replay still lets go of the render eventually.
 			if (game::addr_g_ReplayTimeMs && clean)
 			{
-				const bool last  = s_clipN <= 0 || s_clipAt >= s_clipN - 1;
-				const int  limit = last ? kAudioStall : kAudioStall * 8;
+				const bool last    = s_clipN <= 0 || s_clipAt >= s_clipN - 1;
+				const int  limitMs = last ? kAudioStallMs : kAudioStallMs * 8;
 
 				const float now = *(float*)game::addr_g_ReplayTimeMs;
 
@@ -1844,14 +1934,27 @@ namespace render
 					return;
 				}
 
+				// "The clock has not moved for long enough" - measured in TIME, not
+				// in presents.
+				//
+				// It used to count presents, which made the threshold mean wildly
+				// different things on different machines: 90 presents is 1.5s at
+				// 60fps, 9s at 10fps, and 0.45s at 200fps. The last is the
+				// dangerous end - a brief hitch could be read as the end of the
+				// project and truncate the wav, which the frame pass then inherits
+				// as its length. A wall-clock window says the same thing on every
+				// machine.
+				const uint32_t tick = GetTickCount();
 				if (s_lastClock >= 0.0f && now <= s_lastClock + 0.001f)
 				{
+					if (s_clockStillTick == 0) s_clockStillTick = tick;
+
 					// Everything the end of an audio pass involves lives in
 					// finish(), including arming the frame pass. Closing the
 					// recorder here as well looked harmless and was not: it
 					// cleared s_audioPass first, so finish() took the frame-pass
 					// branch instead and the second pass was never queued.
-					if (++s_audioStall >= limit)
+					if (tick - s_clockStillTick >= (uint32_t)limitMs)
 					{
 						finish(last ? "audio pass finished"
 						            : "audio pass finished - the clock stopped mid-project",
@@ -1859,7 +1962,7 @@ namespace render
 						return;
 					}
 				}
-				else s_audioStall = 0;
+				else s_clockStillTick = 0;
 				s_lastClock = now;
 			}
 			return;
@@ -2174,24 +2277,61 @@ namespace render
 				const float delta = clock - s_lastClock;
 				if (delta > 0.0f && delta < s_dt * 4.0f)
 				{
-					s_slideTime += delta;
-					// How much clip time one present covers, smoothed. This is the
+					// Credit the advance in OUTPUT time, not authored time.
+					//
+					// This is where slow motion lives for sliding capture. Walking
+					// seeks through sampleTime() and picks up the dilation there;
+					// sliding never seeks - it lets the clip play and watches the
+					// clock - so without this the frame grid below compares
+					// authored ms against output ms and the two run 1:1. A 50%
+					// section then rendered at full speed and ran out of clip
+					// early: 60 frames delivered against 87 asked for, 2.0s of
+					// video against 2.8s of audio.
+					//
+					// Converting BOTH endpoints and subtracting is exact, and
+					// avoids differentiating a piecewise curve across a speed
+					// change where the rate is discontinuous. The per-clip base the
+					// conversion adds cancels in the subtraction.
+					//
+					// The plausibility guard above stays on the RAW delta on
+					// purpose: at 5% the dilated step is twenty times larger and
+					// would trip a bound meant to catch seeks and hitches.
+					double step = delta;
+					if (Config::get().renderMarkerSpeed)
+					{
+						const float a = game::nonDilatedToDilatedMs(s_lastClock);
+						const float b = game::nonDilatedToDilatedMs(clock);
+						if (b > a) step = (double)(b - a);
+					}
+
+					s_slideTime += step;
+					// How much OUTPUT time one present covers, smoothed. This is the
 					// whole measurement AUTO needs: it already folds in the present
 					// rate and the current speed, so no assumption about either.
-					s_slideStep = (s_slideStep <= 0.0) ? delta : s_slideStep * 0.8 + delta * 0.2;
+					//
+					// Dilated for the same reason as the accumulator: the shutter is
+					// a fraction of an OUTPUT frame, so at 50% a 360-degree exposure
+					// must span half as much authored time, not the same amount.
+					s_slideStep = (s_slideStep <= 0.0) ? step : s_slideStep * 0.8 + step * 0.2;
 				}
 
 				// A clock that stops while nothing is loading is the project having
 				// ended on its last clip.
+				//
+				// Timed, not counted, for the same reason as the audio pass: as a
+				// present count this ended the render after 0.45s of stillness on a
+				// fast machine, which is well inside an ordinary hitch.
 				if (delta <= 0.0f)
 				{
-					if (++s_audioStall >= kAudioStall)
+					const uint32_t tick = GetTickCount();
+					if (s_clockStillTick == 0) s_clockStillTick = tick;
+					if (tick - s_clockStillTick >= (uint32_t)kAudioStallMs)
 					{
 						finish("finished - the clock stopped", true);
 						return;
 					}
 				}
-				else s_audioStall = 0;
+				else s_clockStillTick = 0;
 			}
 			s_lastClock = clock;
 
@@ -2523,8 +2663,22 @@ namespace render
 				{
 					s_lastReport = now;
 					const float elapsed = (now - s_startTick) / 1000.0f;
-					const float perFrame = elapsed / (float)s_frame;
-					if (s_openEnded)
+
+					// s_frame is 0 until the first frame lands, and at a high
+					// sample count the first frame can easily take longer than the
+					// report interval - so this divided by zero and printed
+					// "inf s/frame, ~infs left" on exactly the renders whose ETA
+					// anyone actually wants. Report elapsed only until there is a
+					// frame to average over.
+					const bool  haveRate = s_frame > 0;
+					const float perFrame = haveRate ? elapsed / (float)s_frame : 0.0f;
+
+					if (!haveRate)
+					{
+						logger::write("info",
+							"render: still on the first frame, %.0fs elapsed", elapsed);
+					}
+					else if (s_openEnded)
 					{
 						logger::write("info",
 							"render: %d frames, %.0fs elapsed (%.1fs/frame)",

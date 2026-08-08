@@ -217,6 +217,90 @@ struct Config
 	bool  unlimitedCameraDistance = true;
 	float maxCameraDistance       = 20000.0f;
 
+	// ---------------------------------------------------------------------
+	//  The editor "buffering" between every action
+	// ---------------------------------------------------------------------
+	//  After every seek, pause and marker jump the editor precaches, and it
+	//  will not proceed until the GLOBAL, whole-game streaming request count
+	//  has been zero for ten consecutive frames. A modded install never
+	//  reaches that: the scene streamer re-scores the PVS every frame and the
+	//  replay preloader adds requests inside the same loop. So it always runs
+	//  to the give-up timer - 200 frames, which is ~6.7 s at 30 fps and ~20 s
+	//  at 10 - with all editor input dead throughout.
+	//
+	//  It is an idle requirement, not a capacity one, which is why heap, pool
+	//  and VRAM adjusters have never fixed it. This drops that global gate.
+	//  The replay's OWN preload completion check still runs immediately
+	//  afterwards, so the entities for the current window are still waited on;
+	//  we simply stop waiting for the whole map streamer to fall silent.
+	//
+	//  Not a shortcut: this is the branch the engine itself takes after 6600,
+	//  taken immediately instead. On by default because the stock behaviour is
+	//  unusable on any heavily modded install and harmless on a light one
+	//  (where the gate was already being satisfied in a few frames anyway).
+	bool  fastPrecache = true;
+
+	// The precache carries a SECOND, independent 6600-unit budget for audio,
+	// reached after the streaming one: it stops the replay music on entry and
+	// then waits for it to re-prepare. On a clip with radio music that is its
+	// own 200 frames, so without this the streaming fix can look like it did
+	// nothing. Same reasoning, same shipped branch - only the interactive
+	// editor, never a render.
+	bool  fastPrecacheAudio = true;
+
+	// Suspended automatically while an image-sequence render is running, so
+	// captured frames keep the stock guarantee. Set to 0 only to prove that
+	// the render is unaffected - it costs a full stall per rendered frame.
+	bool  fastPrecacheDuringRender = false;
+
+	// Honour per-marker SPEED (slow motion / fast motion) when rendering.
+	//
+	// A marker carries a speed of 5, 20, 35, 50, 100, 125, 150, 175 or 200 %, and
+	// the editor keeps two clocks because of it: the authored timeline the
+	// markers sit on, and real elapsed time. The renderer used to advance the
+	// authored one uniformly, so a slow-motion section rendered at full speed and
+	// produced too few frames - the authored speed was silently discarded.
+	//
+	// With this on, the render clock is real time and each seek converts back,
+	// which is exactly what the engine's own export does. The audio pass already
+	// worked this way (it records a real-time playthrough), so this also removes
+	// an A/V length mismatch on any project that uses speed markers.
+	//
+	// ON, because the old output was simply wrong. Set to 0 to reproduce a render
+	// made by an earlier build, or to A/B the difference - note the frame count
+	// and the output duration both change on a project that uses speed markers.
+	bool  renderMarkerSpeed = true;
+
+	// Hard ceiling, in ms of REAL time, on how long one precache may wait for
+	// the replay's own +/-4s preload to finish.
+	//
+	// This is the last wait left once both stall gates are bypassed, and it is
+	// the only one the engine gives no timer at all: HandleResults answers
+	// "every preload request satisfied", and a request that cannot be satisfied
+	// only leaves the queue after an internal timeout of 10 SECONDS of real
+	// time. One un-streamable entity in the window therefore costs ten seconds
+	// per action, on top of everything else - and if a dense frame's requests do
+	// not fit the request array, nothing ends the wait at all.
+	//
+	// The preloading still happens; only the blocking stops. What is not ready
+	// in time arrives through the urgent path instead, which UrgentModelLoadMs
+	// already bounds. 0 disables the ceiling and restores stock behaviour.
+	//
+	// 1500 leaves room for a genuine window of entities to stream on a healthy
+	// install while capping the pathological case at well under the 10 s it
+	// would otherwise take.
+	int   precacheMaxMs = 1500;
+
+	// Ceiling, in ms, on CReplayModelManager's urgent model load - the
+	// blocking spin that freezes the main thread outright when an entity's
+	// model cannot be streamed. Stock is 5000 for the first failure and 1000
+	// for every one after, per manager.
+	//
+	// The failure path is already graceful (the entity simply does not appear
+	// that frame), so a low value trades a five-second hang for a missing car
+	// for a moment. 0 restores stock.
+	float urgentModelLoadMs = 250.0f;
+
 	// How many 4 MB blocks the replay RECORDER gets.
 	//
 	// This is what decides how long a clip can be, and why that length changes
@@ -636,10 +720,15 @@ struct Config
 	//     walking  = RenderSettleFrames + Samples * (1 + RenderSettleSubFrames)
 	//     sliding  = Samples / Shutter
 	// At the shipped defaults that is 3 + 64*2 = 131 against 64, so sliding is
-	// around 3x faster at a 360-degree shutter. The two are level at 180, and
-	// below that walking wins. presetmaker's help text had this right and this
-	// comment did not; the wrong version had already been copied into the export
-	// menu's description before anyone counted.
+	// around 2x faster at a 360-degree shutter. The two are level at 180, and
+	// below that walking wins.
+	//
+	// It said 3x for a long time - in this comment, in presetmaker's help and in
+	// the export menu - directly above the formula that gives 2.05. The "level at
+	// 180" claim is the tell: N/shutter == 2N only at shutter 0.5, which pins the
+	// 360-degree ratio at 2. Where walking's second present goes is no mystery
+	// either: one to redraw at the seeked time, one to capture it, and they
+	// cannot overlap without capturing a frame the world has already left.
 	int   renderCaptureMode  = 1;
 
 	float renderFps          = 30.0f;
@@ -909,6 +998,30 @@ struct Config
 
 		unlimitedCameraDistance = getBool("UnlimitedCameraDistance", unlimitedCameraDistance);
 		disableCameraCollision  = getBool("DisableCameraCollision", disableCameraCollision);
+
+		fastPrecache            = getBool("FastPrecache", fastPrecache);
+		fastPrecacheAudio       = getBool("FastPrecacheAudio", fastPrecacheAudio);
+		fastPrecacheDuringRender= getBool("FastPrecacheDuringRender", fastPrecacheDuringRender);
+		urgentModelLoadMs       = getFloat("UrgentModelLoadMs", urgentModelLoadMs);
+		precacheMaxMs = GetPrivateProfileIntA("RockstarEditorPlus", "PrecacheMaxMs",
+			precacheMaxMs, ini.c_str());
+
+		// Below ~100 ms nothing could stream even on a healthy install, which
+		// would push every entity onto the urgent path for no gain. 0 is the
+		// documented "no ceiling" value and is left alone.
+		if (precacheMaxMs < 0) precacheMaxMs = 0;
+		if (precacheMaxMs > 0 && precacheMaxMs < 100) precacheMaxMs = 100;
+		if (precacheMaxMs > (int)gsig::PRELOAD_TIME_MAX_MS)
+			precacheMaxMs = (int)gsig::PRELOAD_TIME_MAX_MS;
+
+		// Below ~16 ms the urgent load cannot complete even a resident model's
+		// bookkeeping inside one call, which turns every entity creation into a
+		// guaranteed miss. Negative is meaningless; 0 is the documented
+		// "restore stock" value and is left alone.
+		if (urgentModelLoadMs < 0.0f) urgentModelLoadMs = 0.0f;
+		if (urgentModelLoadMs > 0.0f && urgentModelLoadMs < 16.0f) urgentModelLoadMs = 16.0f;
+		if (urgentModelLoadMs > gsig::MODELMGR_TIMEOUT_STOCK)
+			urgentModelLoadMs = gsig::MODELMGR_TIMEOUT_STOCK;
 		hideEditorSpinner        = getBool("HideEditorSpinner", hideEditorSpinner);
 		uncapZoom               = getBool("UncapZoom", uncapZoom);
 		zoomMinFov              = getFloat("ZoomMinFov", zoomMinFov);
@@ -961,11 +1074,76 @@ struct Config
 		renderFps          = rFloat("RenderFps", renderFps);
 		renderSamples      = rInt("RenderSamples", renderSamples);
 		renderShutter      = rFloat("RenderShutter", renderShutter);
+
+		// None of these were checked at all, and the render pipeline divides by
+		// two of them. RenderFps=0 is the sharp edge: s_dt = 1000/fps becomes
+		// inf, the frame count collapses to 2, and sampleTime() hands the replay
+		// a NaN to seek to. Negative runs the output timeline backwards.
+		//
+		// The ceilings are deliberately loose rather than opinionated - rendering
+		// at a high rate and blending in post is a real workflow the capture code
+		// explicitly supports - so these only catch values that cannot be meant.
+		if (!(renderFps > 0.0f) || renderFps > 1000.0f)
+		{
+			logger::write("info",
+				"config: RenderFps=%.4g is out of range - using 30. The render divides "
+				"by this, so 0 or negative produces a NaN seek rather than a bad video.",
+				renderFps);
+			renderFps = 30.0f;
+		}
+
+		// <=1 already means "no blur" everywhere downstream, so the floor is only
+		// about keeping the divisor sane; the ceiling is what stops a stray extra
+		// digit turning one output frame into an hour of capture.
+		if (renderSamples < 1)    renderSamples = 1;
+		if (renderSamples > 4096) renderSamples = 4096;
+
+		// The value is a FRACTION of the frame interval - 1.0 already IS 360
+		// degrees - but it is presented as "Shutter angle", which invites
+		// entering 180. Nothing checked it, and 180 sailed through: at 24fps
+		// that asks for a 7500 ms exposure per frame, the sliding controller
+		// chases it to its 1.0x speed ceiling, and a single "frame" consumes the
+		// entire clip. Observed on a real render - 5 frames delivered out of 83,
+		// with ffmpeg exiting 0 as though nothing were wrong, which is the worst
+		// possible way for a setting to be wrong.
+		//
+		// Above 2 is not a fraction anyone means: it would expose each frame for
+		// more than twice its own interval. Read it as the degrees it plainly is
+		// and say so, rather than clamping to 2 and quietly delivering something
+		// nobody asked for either.
+		if (renderShutter > 2.0f)
+		{
+			const float asDegrees = renderShutter;
+			renderShutter = asDegrees / 360.0f;
+			logger::write("info",
+				"config: RenderShutter=%.4g looks like DEGREES - reading it as %.4g "
+				"(%.4g/360). The key is a fraction of the frame interval: 1.0 is a "
+				"360-degree shutter, 0.5 the 180-degree film convention.",
+				asDegrees, renderShutter, asDegrees);
+		}
+
+		// A zero or negative shutter means every sample lands on the same instant
+		// - no blur, and in sliding mode a target the controller cannot converge
+		// on. Keep it just above zero instead.
+		if (!(renderShutter > 0.0f)) renderShutter = 1.0f;
+		if (renderShutter < 0.01f)   renderShutter = 0.01f;
+		if (renderShutter > 2.0f)    renderShutter = 2.0f;
 		renderSettleFrames = rInt("RenderSettleFrames", renderSettleFrames);
 		renderSettleSubFrames = rInt("RenderSettleSubFrames", renderSettleSubFrames);
 		if (renderSettleSubFrames < 1) renderSettleSubFrames = 1;
+
+		// A negative settle is silently "none"; a huge one multiplies every
+		// frame's cost by itself and reads as a hang. Both are worth refusing.
+		if (renderSettleFrames < 0)   renderSettleFrames = 0;
+		if (renderSettleFrames > 240) renderSettleFrames = 240;
+
 		renderJpeg         = rBool("RenderJpeg", renderJpeg);
 		renderQuality      = rInt("RenderQuality", renderQuality);
+
+		// JPEG quality is a percentage. Out of range it reaches the encoder as
+		// whatever the integer happened to be.
+		if (renderQuality < 1)   renderQuality = 1;
+		if (renderQuality > 100) renderQuality = 100;
 
 		// THIS LINE WAS MISSING. The key was declared, copied into the render
 		// settings, handed to the add-on and listed in kMoved so the migration
@@ -1017,6 +1195,7 @@ struct Config
 
 		renderKeepFrames      = rBool("RenderKeepFrames", renderKeepFrames);
 		renderAudio           = rBool("RenderAudio", renderAudio);
+		renderMarkerSpeed     = rBool("RenderMarkerSpeed", renderMarkerSpeed);
 		{
 			char b[MAX_PATH]{};   rStr("FfmpegPath", "", b, sizeof(b));
 			ffmpegPath = b;

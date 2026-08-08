@@ -765,6 +765,42 @@ namespace smoothblend
 			w.have[4] ? rmarker::timeMs(w.m[4]) : tNext + span,
 		};
 
+		// =====================================================================
+		//  The clock, remapped through this marker's ease
+		// =====================================================================
+		//  Hoisted above the branch chain because EVERY channel has to share it.
+		//  It did not used to be: the ease was applied to rotation (and through
+		//  rotFrac to FOV and the framing scalars) unconditionally, but position
+		//  only ever saw it in the final `else` branch. With the shipping default
+		//  - NaturalPacing on - the chain stops at `naturalPath` long before that,
+		//  so setting an ease eased the framing while the dolly kept moving at
+		//  full natural pace. The control looked like it worked, which is worse
+		//  than it plainly not working: you get a camera whose aim slows into the
+		//  keyframe and whose body does not.
+		//
+		//  Remapping TIME rather than the curve parameter is what makes this safe
+		//  to apply to natural pacing at all. The path is untouched - same curve,
+		//  same shape, same endpoints - and only the rate along it changes, which
+		//  is exactly what an ease is meant to be.
+		//
+		//  With no ease set, ease() returns t unchanged, so easedNow == now to the
+		//  bit and every existing shot renders identically. That identity is the
+		//  whole safety argument for touching the default path, and it is worth
+		//  preserving in any future edit here.
+		const float easeIn  = ms.has(rsettings::P_EASE_IN)  ? ms.v[rsettings::P_EASE_IN]  : 0.0f;
+		const float easeOut = ms.has(rsettings::P_EASE_OUT) ? ms.v[rsettings::P_EASE_OUT] : 0.0f;
+		const bool  hasEase = (easeIn > 0.0f) || (easeOut > 0.0f);
+
+		// Clock -> eased clock, on the same ms scale, clamped to this segment.
+		auto easedAt = [&](float when) -> float {
+			if (!hasEase) return when;
+			float x = (when - tCurr) / span;
+			if (!(x > 0.0f)) x = 0.0f;
+			if (x > 1.0f)    x = 1.0f;
+			return tCurr + spline::ease(x, easeIn, easeOut) * span;
+		};
+		const float easedNow = easedAt(now);
+
 		float u = 0.0f; // curve parameter on the active segment
 
 		// Natural pacing replaces the whole distance pipeline: the position is
@@ -810,14 +846,25 @@ namespace smoothblend
 			// A CENTRED difference on a function of project time, exactly like
 			// the two branches below: scrub to t, get the same speed, and a
 			// re-render still matches the take that was approved.
+			// Sampled through easedAt for the same reason the eased branch below
+			// differentiates its ease curve: this must be the speed of the motion
+			// the camera is ACTUALLY making, or an ease-in hands the shake full
+			// amplitude while the camera is still accelerating. With no ease
+			// easedAt is the identity, so this is the previous expression exactly.
 			constexpr float kH = 8.0f;   // ms
 			const Vec3 ctrl[4] = { c1, c2, c3, c4 };
-			const Vec3 pA = spline::hermitePos(ctrl, tk, now - kH);
-			const Vec3 pB = spline::hermitePos(ctrl, tk, now + kH);
+			const Vec3 pA = spline::hermitePos(ctrl, tk, easedAt(now - kH));
+			const Vec3 pB = spline::hermitePos(ctrl, tk, easedAt(now + kH));
 			s_pathSpeed      = (pB - pA).length() / (2.0f * kH * 0.001f);
 			s_pathSpeedValid = true;
 		}
-		else if (cfg.smoothSpeedProfile && !ms.has(rsettings::P_EASE_IN) && !ms.has(rsettings::P_EASE_OUT))
+		// hasEase, not ms.has(): a key that is PRESENT but zero is not an ease.
+		// This used to test presence, so dialling an ease back down to 0 left the
+		// marker on the per-segment path instead of returning it to the smooth
+		// speed profile - i.e. you could not undo it from the menu, only by
+		// deleting the key. spline::ease() already treats 0/0 as the identity, so
+		// the two agree now.
+		else if (cfg.smoothSpeedProfile && !hasEase)
 		{
 			const float lenPrev = w.have[1] ? spline::segmentLength(c0, c1, c2, c3, alpha) : lenCurr;
 			const float lenNext = w.have[4] ? spline::segmentLength(c2, c3, c4, c5, alpha) : lenCurr;
@@ -859,9 +906,7 @@ namespace smoothblend
 			if (!(t > 0.0f)) t = 0.0f;
 			if (t > 1.0f)    t = 1.0f;
 
-			const float frac = spline::ease(t,
-				ms.has(rsettings::P_EASE_IN)  ? ms.v[rsettings::P_EASE_IN]  : 0.0f,
-				ms.has(rsettings::P_EASE_OUT) ? ms.v[rsettings::P_EASE_OUT] : 0.0f);
+			const float frac = spline::ease(t, easeIn, easeOut);
 
 			u = cfg.arcLengthRemap
 				? spline::paramAtDistance(c1, c2, c3, c4, frac * lenCurr, alpha)
@@ -871,14 +916,13 @@ namespace smoothblend
 			// than the pchip, so an ease-in genuinely ramps the shake up with
 			// the move instead of the shake arriving at full strength while the
 			// camera is still accelerating.
+			//
+			// Expressed through the hoisted easedAt so there is ONE definition of
+			// the ease in this function; fracAt is just that value back as a 0..1
+			// fraction of the segment.
 			constexpr float kH = 8.0f;   // ms
 			auto fracAt = [&](float when) {
-				float x = (when - tCurr) / span;
-				if (!(x > 0.0f)) x = 0.0f;
-				if (x > 1.0f)    x = 1.0f;
-				return spline::ease(x,
-					ms.has(rsettings::P_EASE_IN)  ? ms.v[rsettings::P_EASE_IN]  : 0.0f,
-					ms.has(rsettings::P_EASE_OUT) ? ms.v[rsettings::P_EASE_OUT] : 0.0f);
+				return span > 1e-6f ? (easedAt(when) - tCurr) / span : 0.0f;
 			};
 			const float f1 = fracAt(now - kH), f2 = fracAt(now + kH);
 			s_pathSpeed = fabsf(f2 - f1) * lenCurr / (2.0f * kH * 0.001f);
@@ -899,7 +943,11 @@ namespace smoothblend
 			// mirrored interval where a neighbour is missing - exactly what a
 			// time-parameterised Hermite needs.
 			const Vec3 ctrl[4] = { c1, c2, c3, c4 };
-			Vec3 pos = naturalPath ? spline::hermitePos(ctrl, tk, now)
+			// easedNow, not now: with no ease the two are identical, and with one
+			// set this is what makes the dolly ease along with the framing instead
+			// of the two disagreeing. The non-natural branch already carries the
+			// ease inside u.
+			Vec3 pos = naturalPath ? spline::hermitePos(ctrl, tk, easedNow)
 			                       : spline::catmullRom(c1, c2, c3, c4, u, alpha);
 
 			// DIAGNOSTIC: exaggerate how far the curve departs from the straight
@@ -987,19 +1035,11 @@ namespace smoothblend
 		// and the framing should go with it - and it does not bring the kick
 		// back, because an ease ramp has zero derivative at both ends, so two
 		// eased segments meet at a matched rate instead of a mismatched one.
-		float rotAt = now;
-		{
-			const bool hasEase = ms.has(rsettings::P_EASE_IN) || ms.has(rsettings::P_EASE_OUT);
-			if (hasEase)
-			{
-				float t = (now - tCurr) / span;
-				if (!(t > 0.0f)) t = 0.0f;
-				if (t > 1.0f)    t = 1.0f;
-				rotAt = tCurr + spline::ease(t,
-					ms.has(rsettings::P_EASE_IN)  ? ms.v[rsettings::P_EASE_IN]  : 0.0f,
-					ms.has(rsettings::P_EASE_OUT) ? ms.v[rsettings::P_EASE_OUT] : 0.0f) * span;
-			}
-		}
+		// The same eased clock the position now uses. This used to compute its own
+		// copy, which is how the two drifted apart in the first place - one site
+		// applied the ease and the other did not, and nothing tied them together.
+		// One value, one place, every channel.
+		const float rotAt = easedNow;
 		// The same instant as a 0..1 fraction of the segment, for the handful of
 		// scalar framing terms that are only meaningful within one segment.
 		const float rotFrac = span > 1e-6f ? (rotAt - tCurr) / span : 0.0f;
@@ -1437,6 +1477,11 @@ namespace smoothblend
 		// marker storage, which does not exist until a clip is open - so this
 		// cannot be done from install() and has to be retried until it takes.
 		limits::tick();
+
+		// Reporting only - the precache hooks themselves are installed up front.
+		// Outside the enabled check for the same reason as the leash: the stall
+		// this removes is not a spline feature.
+		precache::tick();
 
 		if (!Config::get().enabled) return;
 

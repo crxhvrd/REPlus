@@ -79,11 +79,18 @@ static Setting kSettings[] =
 
 { "RenderCaptureMode", "Capture mode", S_CHOICE, "Walking|Sliding",
   "Sliding - the clip PLAYS in slow motion: it advances to each frame's mark, then exposes Motion blur samples consecutive frames with the world still simulating between them. Particles step, and anything with temporal history (TAA, SSR, ray tracing) stays warm instead of being reset at every sample.\r\n"
-  "The default, and roughly 3x faster than Walking at a 360-degree shutter - it needs one frame per sample where Walking needs a settle frame too. That edge is shutter-dependent: it needs Samples/Shutter frames, so at 0.5 the two are level and below that Walking wins.\r\n"
+  "The default, and about 2x faster than Walking at a 360-degree shutter. Sliding spends one present per sample; Walking spends two - one to redraw at the new time, one to capture it - so it costs 2N+2 presents per frame against sliding's N.\r\n"
+  "That edge is shutter-dependent: sliding needs Samples/Shutter presents, so at 0.5 the two are level and below that Walking wins.\r\n"
   "Walking - pause, seek to each sub-sample, grab, average. Exact shutter placement, deterministic frame times, and a more obvious failure mode: a repeated frame rather than a smeared one. Use it if a sliding render looks wrong, or for short shutters.", false, true },
 
 { "RenderFps", "Frame rate", S_INT, nullptr,
   "Output frame rate, independent of the rate the game is running at. Halving it halves the render time.", false },
+
+{ "RenderMarkerSpeed", "Honour marker speed", S_BOOL, nullptr,
+  "Render a marker's SPEED setting - slow motion and fast motion - instead of ignoring it.\r\n"
+  "A marker carries a speed of 5 to 200%, and the editor keeps two clocks because of it: the timeline the markers sit on, and real elapsed time. The renderer used to advance the first one uniformly, so a slow-motion section came out at full speed and produced too few frames.\r\n"
+  "The audio pass always recorded a real-time playthrough, so it already had the slow motion - which means this also fixes video and audio ending up different lengths on any project that uses speed markers.\r\n"
+  "Leave it on. Turn it off only to reproduce a render made by an older build: the frame count and the output duration both change on a project that uses speed markers.", false, true },
 
 { "RenderSamples", "Motion blur samples", S_INT, nullptr,
   "Sub-frames averaged into each output frame. 1 = no blur.\r\n"
@@ -91,7 +98,8 @@ static Setting kSettings[] =
   "64 means 64 captures per output frame; drop to 3 while setting a shot up.\r\n"
   "Exact in both capture modes. Walking seeks to each instant; sliding advances the clip to the frame's mark and then takes this many consecutive presents, with the world still simulating between them.", false },
 
-{ "RenderShutter", "Shutter angle", S_FLOAT, nullptr,
+{ "RenderShutter", "Shutter (1.0 = 360 deg)", S_FLOAT, nullptr,
+  "A FRACTION of the frame interval, not an angle in degrees - the label used to say \"Shutter angle\", which invited entering 180 and produced a 180x exposure that ate the whole clip in a few frames.\r\n"
   "1.0 exposes the whole frame interval (360 degrees). 0.5 is the 180-degree film convention.\r\n"
   "Free in Walking - it only changes how the samples are spaced.\r\n"
   "In Sliding it also sets the target the playback speed is tuned to, so a shorter shutter means a slower playback and a longer render.", false },
@@ -160,6 +168,12 @@ static const int kSettingCount = (int)(sizeof(kSettings) / sizeof(kSettings[0]))
 // ---------------------------------------------------------------------------
 //  Codec table for the preset tab
 // ---------------------------------------------------------------------------
+// One entry in the quality dropdown.
+//
+// `args` is normally just the VALUE, which qualityFlag prefixes - "-crf" + "16".
+// An entry whose args already begins with '-' carries its own flag instead and
+// qualityFlag is skipped for it, which is what lets one codec offer both
+// quality-targeted and bitrate-targeted entries in the same list. See buildArgs.
 struct Quality { const char* label; const char* args; };
 
 struct Codec
@@ -167,7 +181,9 @@ struct Codec
     const char* name;
     const char* video;
     const char* qualityFlag;
-    Quality     quality[5];
+    // Was [5], which x264 filled exactly - there was no room to add anything
+    // without silently truncating the terminator.
+    Quality     quality[12];
     const char* exts[5];
     const char* pixFmts[5];
     const char* note;
@@ -176,25 +192,47 @@ struct Codec
 static const Codec kCodecs[] =
 {
     { "H.264 (x264)", "libx264", "-crf",
-      { {"Visually lossless (16)","16"}, {"High (18)","18"}, {"Good (20)","20"},
-        {"Smaller (23)","23"}, {nullptr,nullptr} },
+      { {"Visually lossless (CRF 16)","16"}, {"High (CRF 18)","18"}, {"Good (CRF 20)","20"},
+        {"Smaller (CRF 23)","23"},
+        {"Bitrate 150 Mbps","-b:v 150M"}, {"Bitrate 100 Mbps","-b:v 100M"},
+        {"Bitrate 50 Mbps","-b:v 50M"},   {"Bitrate 25 Mbps","-b:v 25M"},
+        {nullptr,nullptr} },
       { "mp4","mov","mkv",nullptr }, { "yuv420p","yuv444p",nullptr },
-      "The safe default. Plays and edits anywhere." },
+      "The safe default. Plays and edits anywhere.\r\n"
+      "CRF targets a QUALITY and lets the size land where it lands - the right choice when "
+      "the file is going into an editor. A bitrate targets a SIZE and lets quality vary, "
+      "which is what a delivery spec or an upload limit asks for." },
 
     { "H.265 (x265)", "libx265", "-crf",
-      { {"Visually lossless (18)","18"}, {"High (20)","20"}, {"Good (23)","23"}, {nullptr,nullptr} },
+      { {"Visually lossless (CRF 18)","18"}, {"High (CRF 20)","20"}, {"Good (CRF 23)","23"},
+        {"Bitrate 100 Mbps","-b:v 100M"}, {"Bitrate 50 Mbps","-b:v 50M"},
+        {"Bitrate 25 Mbps","-b:v 25M"},   {"Bitrate 12 Mbps","-b:v 12M"},
+        {nullptr,nullptr} },
       { "mp4","mov","mkv",nullptr }, { "yuv420p","yuv444p",nullptr },
-      "Smaller than H.264 at the same quality, slower to encode." },
+      "Smaller than H.264 at the same quality, slower to encode.\r\n"
+      "The bitrate entries here can be roughly half the H.264 figure for a comparable "
+      "picture, which is the whole point of the codec." },
 
     { "HEVC (NVIDIA NVENC)", "hevc_nvenc", "-cq",
-      { {"High (20)","20"}, {"Good (23)","23"}, {nullptr,nullptr} },
+      { {"High (CQ 20)","20"}, {"Good (CQ 23)","23"},
+        {"Bitrate 150 Mbps","-b:v 150M"}, {"Bitrate 100 Mbps","-b:v 100M"},
+        {"Bitrate 50 Mbps","-b:v 50M"},   {"Bitrate 25 Mbps","-b:v 25M"},
+        {nullptr,nullptr} },
       { "mp4","mov","mkv",nullptr }, { "yuv420p",nullptr },
-      "GPU encode - much faster, needs an NVIDIA card." },
+      "GPU encode - much faster, needs an NVIDIA card.\r\n"
+      "A bitrate entry puts NVENC in its VBR mode targeting that average. Hardware encoders "
+      "hold a bitrate more predictably than they hold a quality, so this is the mode where "
+      "targeting size is the more natural of the two." },
 
     { "ProRes 422 HQ", "prores_ks", "-profile:v",
       { {"422 HQ (3)","3"}, {"422 (2)","2"}, {"4444 (4)","4"}, {nullptr,nullptr} },
-      { "mov","mkv",nullptr }, { "yuv422p10le","yuva444p10le",nullptr },
-      "The editing-timeline choice. Large files, grades well." },
+      { "mov","mkv",nullptr }, { "yuv422p10le","yuv444p10le","yuva444p10le",nullptr },
+      "The editing-timeline choice. Large files, grades well.\r\n"
+      "The profile IS the chroma format: 0-3 are 4:2:2, 4 and 5 are 4:4:4. Picking a "
+      "mismatched pair is corrected for you - prores_ks refuses to start on one rather "
+      "than fixing it, which would mean a render that produces no video at all.\r\n"
+      "yuv444p10le keeps full chroma with no alpha plane; yuva444p10le adds alpha, which "
+      "an opaque game capture does not need and pays for in file size." },
 
     { "H.264 lossless", "libx264 -qp 0 -preset veryslow", "",
       { {"Mathematically lossless",""}, {nullptr,nullptr} },
@@ -492,12 +530,54 @@ static std::string buildArgs()
     const Codec& c = kCodecs[selCodec()];
     const int qi = (int)SendMessageA(g_pqual, CB_GETCURSEL, 0, 0);
     std::string s = "-c:v "; s += c.video;
-    if (c.qualityFlag && *c.qualityFlag && qi >= 0 && c.quality[qi].label)
+
+    // An entry whose args start with '-' is complete on its own - that is how a
+    // bitrate target ("-b:v 50M") lives in the same dropdown as a CRF value
+    // ("16") without the codec needing two flags. Anything else is a bare value
+    // and takes the codec's qualityFlag in front of it.
+    //
+    // The lossless codecs pass through untouched: their args are empty, so
+    // neither branch fires and the rate control already sits in `video`.
+    const bool haveQ = qi >= 0 && c.quality[qi].label &&
+                       c.quality[qi].args && *c.quality[qi].args;
+    if (haveQ)
     {
-        s += " "; s += c.qualityFlag; s += " "; s += c.quality[qi].args;
+        const char* a = c.quality[qi].args;
+        if (a[0] == '-')                        { s += " "; s += a; }
+        else if (c.qualityFlag && *c.qualityFlag) { s += " "; s += c.qualityFlag; s += " "; s += a; }
+
+        // Wanted for both rate controls, so it cannot live inside the CRF
+        // branch - a bitrate preset would otherwise silently encode at x264's
+        // default "medium".
         if (strstr(c.video, "libx26")) s += " -preset slow";
     }
-    const std::string pf = comboText(g_ppix);
+    std::string pf = comboText(g_ppix);
+
+    // ProRes: the profile and the pixel format are NOT independent choices, so
+    // do not let two dropdowns pretend they are.
+    //
+    // The profile IS the chroma format - 0..3 are 4:2:2, 4 and 5 are 4:4:4 - and
+    // ffmpeg's prores_ks VALIDATES the pair rather than reconciling it: a 4:2:2
+    // profile with a 4:4:4 pixel format is rejected outright at encoder init,
+    // with "Profile N doesn't support <fmt>" on stderr.
+    //
+    // So "422 HQ (3)" with yuva444p10le is not a slightly-wrong preset, it is an
+    // encoder that never starts and a render that produces no video. This file's
+    // own header claims the broken combination cannot be expressed; for ProRes it
+    // could, because the two lists are offered separately.
+    //
+    // Corrected here rather than by disabling entries, so the preview box shows
+    // the pairing that will actually be written the instant either is changed.
+    if (strcmp(c.video, "prores_ks") == 0 && !pf.empty())
+    {
+        const int  prof    = (qi >= 0 && c.quality[qi].args) ? atoi(c.quality[qi].args) : 3;
+        const bool want444 = prof >= 4;
+        const bool is444   = pf.find("444") != std::string::npos;
+
+        if (want444 && !is444)      pf = "yuv444p10le";   // keep alpha out of it
+        else if (!want444 && is444) pf = "yuv422p10le";
+    }
+
     if (!pf.empty()) { s += " -pix_fmt "; s += pf; }
     return s;
 }

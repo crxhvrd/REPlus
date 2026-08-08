@@ -508,8 +508,9 @@ namespace exportmenu
 				       "shutter is approximate - samples land where the game presented "
 				       "rather than on exact midpoints - and it is usually the FASTER of "
 				       "the two: it needs Samples/Shutter frames where Walking needs a "
-				       "settle frame per sample as well. At a 360-degree shutter that is "
-				       "roughly 3x; at 180 the two are level, and below that Walking wins.";
+				       "settle frame per sample as well - one to redraw at the seeked "
+				       "time, one to capture it. At a 360-degree shutter that is roughly "
+				       "2x; at 180 the two are level, and below that Walking wins.";
 
 			case ROW_SAMPLES:
 				return "Sub-frames averaged into each output frame. Real accumulation "

@@ -39,6 +39,10 @@ namespace game
 	uintptr_t addr_ReplayJumpTo        = 0;
 	uintptr_t addr_SetupReplayBuffer   = 0;
 	uintptr_t addr_IsPlaybackFlagSet   = 0;
+	uintptr_t addr_IsWaitingOnWorldStreaming = 0;
+	uintptr_t addr_g_StreamingStallTimer = 0;
+	uintptr_t addr_AdvanceReaderHandleResults = 0;
+	uintptr_t addr_ModelMgrLoadModel   = 0;
 	uintptr_t addr_g_ReplayBufferInfo  = 0;
 	uintptr_t addr_g_ReplayBlocks      = 0;
 	uintptr_t addr_g_ReplayTotalBlocks = 0;
@@ -138,6 +142,97 @@ namespace game
 	}
 
 	bool clipRange(float& lo, float& hi) { return clipRangeAt(-1, lo, hi); }
+
+	// Real elapsed output time -> the authored (non-dilated) time to seek to.
+	//
+	// This is the whole of slow-motion support. Marker speed makes the two clocks
+	// diverge, and everything else in the renderer already works in non-dilated
+	// time, so converting here is enough - see the note in signatures.h.
+	//
+	// Mirrors the engine's own export loop: take the time INTO the current clip
+	// on the real clock, then let the controller fold in that clip's speed
+	// markers. ConvertTimeToNonDilatedTimeMs already adds the non-dilated time to
+	// the clip's start, so what comes back is project-absolute and needs no
+	// further arithmetic.
+	//
+	// Returns the input unchanged when there is no controller: with no dilation
+	// information the honest answer is the identity, which is exactly the old
+	// behaviour rather than a wrong seek.
+	float dilatedToNonDilatedMs(float dilatedProjectMs)
+	{
+		void* ctrl = controller();
+		if (!ctrl) return dilatedProjectMs;
+
+		const int ci = clipIndex();
+		if (ci < 0) return dilatedProjectMs;
+
+		using LenFn  = float(__fastcall*)(void*, int);
+		using ConvFn = float(__fastcall*)(void*, int, float);
+
+		const float toClip = slot<gsig::PBC_VT_LENTOCLIPMS, LenFn>(ctrl)(ctrl, ci);
+
+		// Clamp rather than pass a negative: a negative time into the clip is
+		// only reachable transiently while a clip step is in flight, and the
+		// conversion is not defined for it.
+		float intoClip = dilatedProjectMs - toClip;
+		if (!(intoClip > 0.0f)) intoClip = 0.0f;
+
+		return slot<gsig::PBC_VT_TOTONDILATED, ConvFn>(ctrl)(ctrl, ci, intoClip);
+	}
+
+	// The inverse: authored time -> real elapsed time.
+	//
+	// Needed because the two capture modes measure opposite things. Walking seeks
+	// to a time, so it converts real -> authored. Sliding lets the clip PLAY and
+	// watches the clock, so what it observes is authored and has to be mapped
+	// onto the output timeline before it can decide a frame is due.
+	//
+	// Callers use the DIFFERENCE of two of these within a clip, which cancels the
+	// per-clip base the conversion adds - so it does not matter that the return
+	// is project-absolute.
+	float nonDilatedToDilatedMs(float nonDilatedProjectMs)
+	{
+		void* ctrl = controller();
+		if (!ctrl) return nonDilatedProjectMs;
+
+		const int ci = clipIndex();
+		if (ci < 0) return nonDilatedProjectMs;
+
+		using LenFn  = float(__fastcall*)(void*, int);
+		using ConvFn = float(__fastcall*)(void*, int, float);
+
+		const float toClip = slot<gsig::PBC_VT_GETSTARTTIME, LenFn>(ctrl)(ctrl, ci);
+
+		float intoClip = nonDilatedProjectMs - toClip;
+		if (!(intoClip > 0.0f)) intoClip = 0.0f;
+
+		return slot<gsig::PBC_VT_TODILATED, ConvFn>(ctrl)(ctrl, ci, intoClip);
+	}
+
+	// Total REAL duration of the project, i.e. how long the finished video runs.
+	// Summed per clip because GetClipTrimmedTimeMs is the dilated length of each
+	// trimmed clip; the non-dilated spans the renderer uses elsewhere would give
+	// the authored length instead, which is the wrong number for a frame count
+	// the moment any marker changes speed. 0 when unavailable.
+	float totalDilatedMs()
+	{
+		void* ctrl = controller();
+		if (!ctrl) return 0.0f;
+
+		const int n = clipCount();
+		if (n <= 0) return 0.0f;
+
+		using Fn = float(__fastcall*)(void*, int);
+		auto trimmed = slot<gsig::PBC_VT_CLIPTRIMMEDMS, Fn>(ctrl);
+
+		float total = 0.0f;
+		for (int i = 0; i < n; ++i)
+		{
+			const float d = trimmed(ctrl, i);
+			if (d > 0.0f) total += d;
+		}
+		return total;
+	}
 
 	int clipIndex()
 	{
@@ -742,6 +837,45 @@ namespace game
 			logger::write("info", "  IsPlaybackFlagSet    = %p (rva 0x%llX)",
 				(void*)addr_IsPlaybackFlagSet,
 				(uint64_t)(addr_IsPlaybackFlagSet ? addr_IsPlaybackFlagSet - memory::base() : 0));
+		}
+
+		// Optional: without it the editor keeps the stock precache wait, i.e. the
+		// full 200-frame give-up after every seek on a modded install.
+		if (const char* p = pick(gsig::REPLAY_ISWAITINGONWORLDSTREAMING); p && *p)
+		{
+			addr_IsWaitingOnWorldStreaming = memory::scan(p).address;
+			logger::write("info", "  IsWaitingOnWorldStrm = %p (rva 0x%llX)",
+				(void*)addr_IsWaitingOnWorldStreaming,
+				(uint64_t)(addr_IsWaitingOnWorldStreaming
+					? addr_IsWaitingOnWorldStreaming - memory::base() : 0));
+
+			// Its own give-up compare names the stall timer, and the audio one
+			// is its neighbour. Only used for the audio half of the fix; a
+			// failed derive leaves that off and the streaming half unaffected.
+			addr_g_StreamingStallTimer = derive(addr_IsWaitingOnWorldStreaming,
+				pickD(gsig::IWWS_STALLTIMER), "g_StreamingStallTimer");
+		}
+
+		// Optional: without it the precache's preload wait stays unbounded, so a
+		// single un-streamable entity holds it for 10 s of real time.
+		if (const char* p = pick(gsig::REPLAY_HANDLERESULTS); p && *p)
+		{
+			addr_AdvanceReaderHandleResults = memory::scan(p).address;
+			logger::write("info", "  AdvReader::HandleRes = %p (rva 0x%llX)",
+				(void*)addr_AdvanceReaderHandleResults,
+				(uint64_t)(addr_AdvanceReaderHandleResults
+					? addr_AdvanceReaderHandleResults - memory::base() : 0));
+		}
+
+		// Optional: without it an un-streamable entity still hangs the main
+		// thread for up to five seconds while it spins LoadAllRequestedObjects.
+		if (const char* p = pick(gsig::REPLAY_MODELMGR_LOADMODEL); p && *p)
+		{
+			addr_ModelMgrLoadModel = memory::scan(p).address;
+			logger::write("info", "  ModelMgr::LoadModel  = %p (rva 0x%llX)",
+				(void*)addr_ModelMgrLoadModel,
+				(uint64_t)(addr_ModelMgrLoadModel
+					? addr_ModelMgrLoadModel - memory::base() : 0));
 		}
 
 		// Optional: without it recording keeps the stock 7-block budget.

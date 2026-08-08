@@ -783,6 +783,195 @@ namespace gsig
 		"48 8B 15 ? ? ? ? 33 C0 48 85 D2 74 06 85 4A 18 0F 95 C0 C3"
 	};
 
+	// -------------------------------------------------------------------------
+	// CReplayMgrInternal::IsWaitingOnWorldStreaming()   leg 0x125394  enh 0x7BDF10
+	//
+	// THE cause of the editor "buffering" between every action on a modded
+	// install. CReplayMgrInternal::Validate() runs a precache after every seek,
+	// pause and marker jump, and refuses to let the replay update proceed until
+	// this answers false for ten consecutive frames. What it actually tests:
+	//
+	//     if (sm_uStreamingStallTimer >= 6600) return false;   // give up
+	//     if (CStreaming::GetNumberObjectsRequested() > 0) return true;
+	//     if (strStreamingEngine::GetIsLoadingPriorityObjects()) return true;
+	//     if (GetInfo().GetNumberRealObjectsRequested())  return true;
+	//     ... then the CVehicle / CPed replay interfaces ...
+	//
+	// The first three are the GLOBAL, whole-game streaming request counters - not
+	// the replay's own. So the editor waits for the entire streaming system to
+	// fall completely idle, and on a modded install it never does: the scene
+	// streamer re-scores the PVS every frame, LOD and HD-txd transitions churn
+	// continuously, and the replay preloader issues fresh requests inside the
+	// very loop that is waiting on them.
+	//
+	// It is an IDLE requirement, not a capacity one, which is why no amount of
+	// heap/pool/VRAM adjustment has ever fixed this - a bigger heap makes the
+	// streamer request MORE. The only exits anyone ever found (draw distance at
+	// 0%, unzooming the camera) work by removing work from the streamer.
+	//
+	// So the precache runs to the 6600 give-up EVERY time. And 6600 accumulates
+	// at MIN(33, frameMs), i.e. 200 frames rather than 6.6 seconds, so below
+	// 30 fps the wall-clock cost grows: ~6.7 s at 30, ~13 s at 15, ~20 s at 10.
+	// Editor input is dead throughout - CVideoEditorPlayback::UpdateInput gates
+	// its whole editing block on !IsPreCachingScene().
+	//
+	// Both builds keep it as a real function; Enhanced inlines
+	// CReplayInterfaceVeh::WaitingForHDVehicles into it (the vehicle-HD wait with
+	// its own 5000 ms sub-timer), which is why the Enhanced body is much longer.
+	//
+	// Patterns key on the 0x19C8/0x19C7 stall-limit compare in the prologue plus
+	// the exact early-out shape; verified unique in both images.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig REPLAY_ISWAITINGONWORLDSTREAMING = {
+		// enh 0x7BDF10 - `cmp dword [rip+d],0x19c7 / jbe` (Clang emits the
+		// >= 6600 test as > 6599), then the shared 4-register epilogue.
+		"56 57 55 53 48 83 EC 28 81 3D ? ? ? ? C7 19 00 00 76 0D 31 ED 89 E8 "
+		"48 83 C4 28 5B 5D 5F 5E C3 E8 ? ? ? ? 40 B5 01 85 C0 7F E9 "
+		"80 3D ? ? ? ? 00 75 E0",
+		// leg 0x125394 - `cmp dword [rip+d],0x19c8 / jnc`, then
+		// GetNumberObjectsRequested and the two flag globals.
+		"40 53 48 83 EC 20 81 3D ? ? ? ? C8 19 00 00 0F 83 ? ? ? ? E8 ? ? ? ? "
+		"85 C0 7E 07 B0 01 E9 ? ? ? ? 80 3D ? ? ? ? 00 75 F0 "
+		"83 3D ? ? ? ? 00 75 E7"
+	};
+
+	// -------------------------------------------------------------------------
+	// CReplayModelManager::LoadModel(this, hash, mapTypeDef, oldVer, createUrgent,
+	//                                &modelReq, &req, flags)   leg 0x128464  enh 0x7974E0
+	//
+	// The SECOND freeze, and a true main-thread hang rather than a state wait.
+	// Every entity the replay creates on a seek - ped, vehicle, object, pickup -
+	// arrives here with createUrgent=true, and the urgent path is:
+	//
+	//     while (createUrgent && req.IsValid() && !req.HasLoaded()) {
+	//         if (timer.GetMsTime() >= m_modelLoadTimeout) {
+	//             m_modelLoadTimeout = 1000.0f;               // after the first failure
+	//             m_failedStreamingRequests.PushAndGrow(...); // and never retried
+	//             return false;
+	//         }
+	//         CStreaming::LoadAllRequestedObjects();          // blocking full flush
+	//     }
+	//
+	// m_modelLoadTimeout starts at 5000.0f, so one un-streamable model costs a
+	// five-second freeze with nothing rendering, then a second each afterwards -
+	// and the model is permanently blacklisted, which is why heavily modded clips
+	// also lose entities.
+	//
+	// Hooked purely to clamp that timeout: `this` is param 1, and the float lives
+	// at +0x20 on both builds (`ucomiss xmm0,[r15+0x20]` on Enhanced,
+	// `comiss [param_1+0x20]` on Legacy, and both write 0x447A0000 = 1000.0f into
+	// it on failure). Writing it on entry needs no separate resolution of the four
+	// per-interface managers - we are handed the one that matters.
+	//
+	// Both patterns anchor on the Casino-DLC maptype guard `cmp r?d, 0x471`
+	// (1137) that opens the function, which is unique and load-bearing.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig REPLAY_MODELMGR_LOADMODEL = {
+		// enh 0x7974E0 - Clang: eight pushes, mov r15,rcx, then the 0x471 guard.
+		"41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 45 89 C4 41 89 D5 "
+		"49 89 CF 45 84 C9 74 16 41 81 FC 71 04 00 00 7C 0D 41 81 FC FF 0F 00 00",
+		// leg 0x128464 - MSVC: home the register args, then the same guard.
+		"48 89 5C 24 08 48 89 74 24 10 44 89 44 24 18 55 57 41 54 41 56 41 57 "
+		"48 8B EC 48 83 EC 70 33 DB 44 8B E2 4C 8B F1 45 84 C9 74 16 "
+		"41 81 F8 71 04 00 00"
+	};
+
+	// -------------------------------------------------------------------------
+	// CReplayAdvanceReader::HandleResults(scannerTypes, flags, time, force, mask)
+	//   leg 0x11F16C   enh 0x7BE190
+	//
+	// The LAST thing holding the precache once the two stall gates are gone, and
+	// the only one of the three with no give-up at all.
+	//
+	//     bool readerResult = sm_pAdvanceReader->HandleResults(PreloaderScanner, ...);
+	//     if (!readerResult) return eValidationOther;      // <- no timer on this
+	//
+	// It returns `m_reachedExtent && requests.size() == 0` for both the entity
+	// and event preloaders, and a request only leaves that array by being
+	// satisfied or by ageing out after an internal 10-second timeout -
+	// and that one is REAL wall clock, not the frame-quantised units the stall
+	// timers use. So one entity whose model cannot be streamed pins the whole
+	// precache for ten seconds. And if the scan cannot fit a dense frame's
+	// requests into the array at all, `m_reachedExtent` stays false and there is
+	// nothing that ever ends the wait.
+	//
+	// We hook it to override the RETURN VALUE only - the original always runs,
+	// so `WaitForAllScanners` still synchronises the two scanner threads and
+	// `ProcessResults` still does the actual preloading. We stop blocking on it
+	// finishing; we do not stop it happening.
+	//
+	// Three call sites, and only the first blocks on the answer:
+	//   Validate()            precache      <- ours
+	//   sm_JumpPrepareState   jump prepare  <- left stock, different machine
+	//   the playback path     result discarded
+	// precache.cpp tells them apart by requiring that the streaming gate ran in
+	// the same Validate call, microseconds earlier, which only site one does.
+	// -------------------------------------------------------------------------
+	inline constexpr Sig REPLAY_HANDLERESULTS = {
+		// enh 0x7BE190 - eight pushes, arg shuffle, then the inlined
+		// WaitForAllScanners guard `cmp byte [rcx+0x110],0` (m_running).
+		"41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 28 45 89 CC 4C 89 C7 "
+		"89 D5 49 89 CF 80 B9 10 01 00 00 00 74 22",
+		// leg 0x11F16C - MSVC frame, arg shuffle, then a real call to
+		// WaitForAllScanners.
+		"48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 48 89 78 20 41 54 41 56 "
+		"41 57 48 83 EC 30 45 8B F1 4D 8B F8 8B EA 48 8B F1"
+	};
+
+	// The engine's own ceiling on a single preload request, measured from the
+	// retail timeout behaviour. Kept so the log can state what stock would have
+	// done; we do not patch it, we bound the wait that consumes it.
+	inline constexpr unsigned PRELOAD_TIME_MAX_MS = 10000;
+
+	// CReplayModelManager::m_modelLoadTimeout. Same offset on both builds; see
+	// the note above for how it was pinned.
+	inline constexpr unsigned MODELMGR_LOADTIMEOUT_OFF = 0x20;
+
+	// -------------------------------------------------------------------------
+	// CReplayMgrInternal::sm_uStreamingStallTimer   leg 0x1EC1F88  enh 0x3E31BE8
+	//
+	// Derived from the FIRST instruction of IsWaitingOnWorldStreaming, which is
+	// its own give-up test:
+	//
+	//     cmp dword [rip+d], 0x19c8      ; leg  (>= 6600)
+	//     cmp dword [rip+d], 0x19c7      ; enh  (Clang: > 6599)
+	//
+	// `81 3D` is the imm32 form, so the displacement is followed by four more
+	// bytes inside the same instruction - hence extra = 4.
+	//
+	// Wanted not for itself but for its NEIGHBOUR. The three precache counters
+	// are consecutive statics of the same type:
+	//
+	//     static u32 sm_uStreamingStallTimer;   // +0
+	//     static u32 sm_uAudioStallTimer;       // +4
+	//     static u32 sm_uStreamingSettleCount;  // +8
+	//
+	// and both retail builds place them exactly four apart (leg 1F88/1F8C/1F90,
+	// enh 1BE8/1BEC/1BF0). That adjacency is an ASSUMPTION, not a proof, so
+	// precache.cpp range-checks the value before ever writing it - see there.
+	// -------------------------------------------------------------------------
+	inline constexpr unsigned char OP_CMPD_IMM32[] = { 0x81, 0x3D }; // cmp dword [rip+d],imm32
+
+	inline constexpr DerivePair IWWS_STALLTIMER = {
+		{ 8, 10, OP_CMPD_IMM32, 2, 4 },   // enh: 4 pushes + sub rsp,0x28 = 8
+		{ 6,  8, OP_CMPD_IMM32, 2, 4 }    // leg: push rbx + sub rsp,0x20  = 6
+	};
+
+	// Offsets from sm_uStreamingStallTimer.
+	inline constexpr unsigned STALL_AUDIO_OFF  = 0x4;
+	inline constexpr unsigned STALL_SETTLE_OFF = 0x8;
+
+	// STREAMING_STALL_LIMIT_MS / AUDIO_STALL_LIMIT_MS, both 6600 in retail.
+	// Reaching it is what makes the engine stop waiting, so writing it is how we
+	// say "stop waiting" without touching the code that reads it.
+	inline constexpr unsigned STALL_LIMIT_MS = 6600;
+
+	// The two values the engine itself writes into that field - 5000 on the
+	// first urgent load and 1000 after a failure - read straight out of the
+	// instruction stream at both write sites. Kept for the "restore stock" path.
+	inline constexpr float MODELMGR_TIMEOUT_STOCK    = 5000.0f;
+	inline constexpr float MODELMGR_TIMEOUT_FALLBACK = 1000.0f;
+
 	inline constexpr unsigned EDIT_RESTRICTION_NONE           = 0;
 	inline constexpr unsigned EDIT_RESTRICTION_FIRST_PERSON   = 1;
 	inline constexpr unsigned EDIT_RESTRICTION_CUTSCENE       = 2;
@@ -1342,8 +1531,8 @@ namespace gsig
 	//
 	// What the two slots above are is now settled: the instance is
 	// CReplayCoordinator's CReplayPlaybackController (leg 0x1D5B9E0,
-	// enh 0x3D72750), whose vtable is IReplayPlaybackController's declaration
-	// order with no virtual destructor - which is why GetClipStartNonDilated
+	// enh 0x3D72750), whose vtable is the clip interface in declaration order
+	// with no virtual destructor - which is why GetClipStartNonDilated
 	// lands on slot 12 and matches the 0x60 read out of both builds. Every slot
 	// below is that same count continued, and each was verified against the
 	// disassembly on Legacy AND Enhanced:
@@ -1371,6 +1560,58 @@ namespace gsig
 	inline constexpr int PBC_VT_GETCLIPINDEX = 0x50;
 	inline constexpr int PBC_VT_GETCLIPCOUNT = 0x58;
 	inline constexpr int PBC_VT_JUMPTOCLIP   = 0x130;
+
+	// -------------------------------------------------------------------------
+	// Time DILATION - what marker speed actually is, and what makes a slow-motion
+	// clip render as slow motion instead of at uniform speed.
+	//
+	// The editor keeps two clocks and every accessor above is on the NON-DILATED
+	// one: that is the authored timeline, where markers sit and where JumpTo
+	// seeks. Real elapsed time is the DILATED one, and the two diverge wherever a
+	// marker sets a speed other than 100% (the enum is 5/20/35/50/100/125/150/
+	// 175/200 %).
+	//
+	// So a render that advances non-dilated time linearly - which is what
+	// render.cpp did - produces uniform speed no matter what the markers say, and
+	// too few frames for the section. The engine's own export gets this right by
+	// advancing REAL output time and converting:
+	//
+	//     clipTimeToSample = accumulatedOutputTime - GetLengthTimeToClipMs(ci)
+	//     nonDilated       = ConvertTimeToNonDilatedTimeMs(ci, clipTimeToSample)
+	//
+	// ...which is what folds in both the trim markers and the marker speeds.
+	//
+	// VERIFIED slot-by-slot on BOTH builds by reading the live vtable out of the
+	// pe-sieve dumps (leg vtbl 0x7FF7707B46F0, enh 0x7FF75A56B800) and
+	// decompiling. Two independent confirmations of the count:
+	//
+	//   - 0xA8's body calls slot 0x98 THROUGH THE VTABLE, and what it does with
+	//     the result is add a per-clip base to a within-clip conversion. That is
+	//     GetLengthNonDilatedTimeToClipMs by behaviour, so the pair proves itself.
+	//   - 0x70 and 0x78 hold the SAME pointer on both builds. Both decompile to
+	//     the identical body - fetch the clip, return one float field - so MSVC
+	//     and Clang each folded the two. A duplicate with an explanation is
+	//     evidence the count is right, not a mis-count.
+	//
+	// GetClipTrimmedTimeMs is the DILATED duration of the trimmed clip - pinned
+	// by the engine comparing it against dilated time in the export loop - so
+	// summing it over the clips gives the real output length.
+	inline constexpr int PBC_VT_CLIPTRIMMEDMS  = 0x80;  // f32 (s32 clipIndex) dilated
+	inline constexpr int PBC_VT_LENTOCLIPMS    = 0x88;  // f32 (s32 clipIndex) dilated
+	inline constexpr int PBC_VT_TODILATED      = 0xA0;  // f32 (s32, f32) -> real
+	inline constexpr int PBC_VT_TOTONDILATED   = 0xA8;  // f32 (s32, f32) -> non-dilated
+
+	// 0xA0 is the mirror of 0xA8 and verified the same way: its body calls slot
+	// 0x88 through the vtable and adds it to a within-clip conversion, which is
+	// the dilated counterpart - and incidentally pins 0x88 as well.
+	// Both directions are needed because the two capture modes measure opposite
+	// things: Walking SEEKS (real -> authored, 0xA8) while Sliding WATCHES the
+	// clip clock and must map what it sees back onto the output timeline
+	// (authored -> real, 0xA0).
+
+	// NOT to be confused with IReplayMarkerStorage's slot 0xA8 (tryGetMarker).
+	// Different interface, same offset, and calling one through the other is a
+	// crash with no obvious cause.
 
 	// Legacy's route to the controller. JumpToNonDilatedTimeMs is a real
 	// function there and does the clamp itself, so the instance is loaded right

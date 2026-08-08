@@ -148,6 +148,39 @@ UncapZoom=1                ; widen the stock 0.45x..4.50x range
 ZoomMinFov=1               ; 1..130 is the engine's own clamp
 ZoomMaxFov=130             ; readout is 45/fov: 1 = 45x in, 130 = 0.35x out
 
+; --- The stall between every action ("buffering") ---------------------------
+; After every seek, pause and marker jump the editor precaches, and stock code
+; will not continue until the GLOBAL, whole-game streaming request count has
+; been zero for ten consecutive frames. A modded install never reaches that -
+; the scene streamer re-scores the view every frame - so it always runs to its
+; give-up timer instead: 200 frames, i.e. ~7s at 30fps and ~20s at 10fps, with
+; all editor input dead throughout.
+;
+; It is an idle requirement, not a memory one, which is why heap/pool/VRAM
+; adjusters have never helped. FastPrecache drops that global gate. The
+; replay's OWN preload for the current +/-4s is still waited on, so entities
+; are still there; only "the whole map streamer must be silent" goes away.
+FastPrecache=1             ; 0 = stock (unusable on a heavily modded install)
+; The precache has a SECOND, independent 200-frame budget for audio: it stops
+; the replay music on entry and then waits for it to re-prepare. On a clip with
+; radio music that alone can cost as much as the streaming gate did, so without
+; this the fix above can look like it did nothing.
+FastPrecacheAudio=1
+FastPrecacheDuringRender=0 ; renders keep the stock wait; 1 only to A/B it
+; Hard ceiling in ms of REAL time on how long one precache may wait for the
+; replay's own +/-4s preload. This is the last wait left once the two gates
+; above are bypassed, and the only one the engine gives no timer to at all: an
+; entity whose model cannot stream sits in the request queue for a full 10
+; SECONDS before ageing out, and a request array that will not fit a dense
+; frame never clears. The preloading still happens either way - only the
+; blocking stops, and whatever is not ready arrives through the urgent path
+; that UrgentModelLoadMs bounds. 0 = stock (unbounded).
+PrecacheMaxMs=1500
+; Ceiling in ms on the urgent model load, which otherwise freezes the main
+; thread outright - 5000 for the first entity that cannot stream, 1000 after.
+; The failure path is graceful (the entity just misses a frame). 0 = stock.
+UrgentModelLoadMs=250
+
 ; --- Scene: the clip's time of day and weather ------------------------------
 ; A clip records the clock and the weather every frame and plays them back, so
 ; neither can normally be changed. These substitute different values as the
@@ -248,6 +281,18 @@ RenderVideoExt=mp4
 ; Video muxes it in, Frames leaves audio.wav beside the sequence with the ffmpeg
 ; line to attach it written into assemble.txt.
 RenderAudio=1
+; Honour per-marker SPEED (slow motion / fast motion).
+; A marker carries a speed of 5..200%, and the editor keeps two clocks because
+; of it: the authored timeline the markers sit on, and real elapsed time. The
+; renderer used to advance the authored one uniformly, so a slow-motion section
+; rendered at full speed and produced too few frames - the authored speed was
+; silently thrown away. With this on the render clock is real time and each seek
+; converts back, which is what the game's own export does.
+; The audio pass already worked this way (it records a real-time playthrough),
+; so this also removes an A/V length mismatch on projects that use speed markers.
+; 0 reproduces a render made by an earlier build. Note the frame count and the
+; output duration both change on a project that uses speed markers.
+RenderMarkerSpeed=1
 ; Borrow a track from a file instead. Ignored while RenderAudio=1.
 AudioFromFile=
 ]==])

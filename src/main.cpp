@@ -28,6 +28,9 @@ static void InstallResolved()
 	smoothblend::install();
 	menu::install();
 	limits::install();
+	// Before scene::install() for no reason other than ordering with limits -
+	// nothing here depends on install order; both only place hooks.
+	precache::install();
 	scene::install();
 	exporthook::install();
 	// After exporthook, which owns what the Export button DOES; this owns the
